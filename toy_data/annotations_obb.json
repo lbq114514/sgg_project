@@ -1,0 +1,133 @@
+{
+  "images": [
+    {
+      "id": 0,
+      "file_name": "0000.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    },
+    {
+      "id": 1,
+      "file_name": "0001.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    },
+    {
+      "id": 2,
+      "file_name": "0002.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    },
+    {
+      "id": 3,
+      "file_name": "0003.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    },
+    {
+      "id": 4,
+      "file_name": "0004.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    },
+    {
+      "id": 5,
+      "file_name": "0005.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    },
+    {
+      "id": 6,
+      "file_name": "0006.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    },
+    {
+      "id": 7,
+      "file_name": "0007.png",
+      "width": 256,
+      "height": 256,
+      "objects": [
+        { "bbox": [60.0, 60.0, 60.0, 60.0, 0.0], "label": 1 },
+        { "bbox": [145.0, 65.0, 70.0, 50.0, 0.0], "label": 2 },
+        { "bbox": [125.0, 175.0, 90.0, 70.0, 0.0], "label": 3 }
+      ],
+      "relations": [
+        { "subject_id": 0, "object_id": 1, "predicate": 1 },
+        { "subject_id": 1, "object_id": 2, "predicate": 2 }
+      ]
+    }
+  ],
+  "categories": {
+    "obj1": 1,
+    "obj2": 2,
+    "obj3": 3
+  },
+  "predicates": {
+    "left_of": 1,
+    "overlap_with": 2
+  }
+}

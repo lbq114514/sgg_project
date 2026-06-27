@@ -1,0 +1,1 @@
+from .latent_subgraph_head import LatentSubgraphRelationHead

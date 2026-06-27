@@ -1,0 +1,4 @@
+from .simple_roi_extractor import SimpleROIExtractor
+from .hbb_roi_extractor import HBBROIExtractor
+from .multiscale_roi_extractor import MultiScaleROIExtractor
+from .rotated_roi_extractor import RotatedROIExtractor

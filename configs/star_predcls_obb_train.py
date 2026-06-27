@@ -1,0 +1,209 @@
+import os
+
+from sgg.config.defaults import get_default_cfg
+
+
+DATA_ROOT = os.environ.get("STAR_SGG_ROOT", "data/STAR_SGG")
+
+
+cfg = get_default_cfg()
+cfg["MODEL"]["TASK"] = "predcls"
+cfg["MODEL"]["BOX_MODE"] = "obb"
+cfg["MODEL"]["USE_COMBINED_ROI_HEADS"] = True
+cfg["MODEL"]["FREEZE_BACKBONE"] = True
+cfg["MODEL"]["FREEZE_NECK"] = True
+cfg["MODEL"]["FREEZE_RPN_HEAD"] = True
+cfg["MODEL"]["FREEZE_ROI_HEAD"] = True
+
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PREDICTOR"] = "RPCM"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["USE_GT_BOX"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["USE_GT_OBJECT_LABEL"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_USE_PROTOTYPE"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_SEMANTIC_PUSH_ENABLED"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_ANTONYM_PAIRS"] = []
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_COMPETITOR_PAIRS"] = []
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_LAMBDA_PULL"] = 0.2
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_LAMBDA_SEP"] = 0.005
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_LAMBDA_ANT_SEP"] = 0.1
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_LAMBDA_COMP_SEP"] = 0.01
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_ANT_SEP_MARGIN"] = -0.20
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_COMP_SEP_MARGIN"] = 0.20
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_SEP_TYPE"] = "etf"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PROTO_TEXT_INIT_MODIFIER_AWARE"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_PAIR_LABEL_PRIOR"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_PAIR_PRIOR_DIM"] = 128
+cfg["MODEL"]["ROI_RELATION_HEAD"]["HIER_PAIRNESS_SCORE_WEIGHT"] = 0.0
+cfg["MODEL"]["ROI_RELATION_HEAD"]["CONTEXT_HIDDEN_DIM"] = 512
+cfg["MODEL"]["ROI_RELATION_HEAD"]["CONTEXT_POOLING_DIM"] = 2048
+cfg["MODEL"]["ROI_RELATION_HEAD"]["EMBED_DIM"] = 200
+cfg["MODEL"]["ROI_RELATION_HEAD"]["WORD_EMBEDDING_FEATURES"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["CAUSAL"]["SPATIAL_FOR_VISION"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["UNION_ROI_ALIGN_CHUNK_SIZE"] = 1024
+cfg["MODEL"]["ROI_RELATION_HEAD"]["BATCH_SIZE_PER_IMAGE"] = 512
+cfg["MODEL"]["ROI_RELATION_HEAD"]["POSITIVE_FRACTION"] = 0.5
+cfg["MODEL"]["ROI_RELATION_HEAD"]["MAX_TEST_PAIRS_PER_IMAGE"] = 0
+cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_PAIR_SAMPLER"] = "ALL"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_FILTER_METHOD"] = "PPG"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["SEMA_F_ENABLED"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["SEMA_F_PATH"] = "pretrained/SF_list_support.json"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_ENABLED"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_PAIR_THRESHOLD"] = 10000
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_TOPK"] = 10000
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_CHUNK_SIZE"] = 1000000
+cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_BASE_PAIR_KEEP_TOPK"] = 0
+cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_SUBGRAPH_COMPLETION_TOPK"] = 0
+cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_PAIRNESS_TOPK"] = 0
+cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_PAIRNESS_COMPLETION_TOPK"] = 0
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_ENCODING_DIM"] = 25
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_HIDDEN_DIM1"] = 50
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_HIDDEN_DIM2"] = 50
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_MODEL_PATH_OBB"] = "pretrained/STAR_OBB.pth"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_MODEL_PATH_HBB"] = "pretrained/STAR_HBB.pth"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PREDICATE_LOSS_TYPE"] = "ce"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_MLP_DIM"] = 2048
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_FEAT_UPDATE_STEP"] = 4
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_DROPOUT"] = 0.2
+
+cfg["MODEL"]["BACKBONE"] = {
+    "NAME": "swin",
+    "EMBED_DIMS": 192,
+    "PATCH_SIZE": 4,
+    "WINDOW_SIZE": 7,
+    "MLP_RATIO": 4,
+    "DEPTHS": (2, 2, 18, 2),
+    "NUM_HEADS": (6, 12, 24, 48),
+    "OUT_INDICES": (0, 1, 2, 3),
+    "PATCH_NORM": True,
+    "DROP_RATE": 0.0,
+    "ATTN_DROP_RATE": 0.0,
+    "DROP_PATH_RATE": 0.2,
+    "WITH_CP": True,
+}
+cfg["MODEL"]["NECK"] = {
+    "NAME": "fpn_neck",
+    "IN_CHANNELS": [192, 384, 768, 1536],
+    "OUT_CHANNELS": 256,
+    "NUM_OUTS": 5,
+    "UPSAMPLE_MODE": "nearest",
+}
+cfg["MODEL"]["RPN_HEAD"] = {
+    "NAME": "oriented_rpn_head",
+    "IN_CHANNELS": 256,
+    "FEAT_CHANNELS": 256,
+    "NUM_ANCHORS": 3,
+    "CLS_OUT_CHANNELS": 1,
+    "VERSION": "le90",
+    "USE_SIGMOID_CLS": True,
+}
+cfg["MODEL"]["PRETRAINED_DETECTOR"] = "pretrained/OBB_swin_L_OBD.pth"
+cfg["MODEL"]["ROI_EXTRACTOR"]["NAME"] = "rotated_roi_extractor"
+cfg["MODEL"]["ROI_EXTRACTOR"]["OUT_CHANNELS"] = 512
+cfg["MODEL"]["ROI_EXTRACTOR"]["FEATURE_KEY"] = "p2"
+cfg["MODEL"]["ROI_EXTRACTOR"]["POOL_SIZE"] = 7
+cfg["MODEL"]["ROI_EXTRACTOR"]["FEATURE_STRIDE"] = 4
+cfg["MODEL"]["ROI_EXTRACTOR"]["ANGLE_VERSION"] = "le90"
+cfg["MODEL"]["DETECTION_FEATURE_KEY"] = "p2"
+cfg["MODEL"]["RELATION_HEAD"]["NODE_DIM"] = 512
+cfg["MODEL"]["RELATION_HEAD"]["EDGE_DIM"] = 512
+cfg["MODEL"]["RELATION_HEAD"]["HIDDEN_DIM"] = 512
+cfg["MODEL"]["ROI_HEADS"]["FG_IOU_THRESHOLD"] = 0.5
+cfg["MODEL"]["ROI_HEADS"]["BG_IOU_THRESHOLD"] = 0.3
+cfg["MODEL"]["ROI_HEADS"]["BATCH_SIZE_PER_IMAGE"] = 256
+cfg["MODEL"]["ROI_HEADS"]["POSITIVE_FRACTION"] = 0.5
+cfg["MODEL"]["ROI_HEADS"]["DETECTIONS_PER_IMG"] = 80
+cfg["MODEL"]["ROI_BOX_HEAD"]["MLP_HEAD_DIM"] = 4096
+
+cfg["DATALOADER"]["BATCH_SIZE"] = 8
+cfg["DATALOADER"]["TRAIN_BATCH_SIZE"] = 16
+cfg["DATALOADER"]["VAL_BATCH_SIZE"] = 4
+cfg["DATALOADER"]["TEST_BATCH_SIZE"] = 4
+cfg["DATALOADER"]["NUM_WORKERS"] = 8
+cfg["DATALOADER"]["SIZE_DIVISIBLE"] = 32
+
+cfg["SOLVER"]["BASE_LR"] = 1e-3
+cfg["SOLVER"]["OPTIMIZER"] = "AdamW"
+cfg["SOLVER"]["WEIGHT_DECAY_BIAS"] = 1e-4
+cfg["SOLVER"]["BIAS_LR_FACTOR"] = 1.0
+cfg["SOLVER"]["MOMENTUM"] = 0.9
+cfg["SOLVER"]["WARMUP_EPOCHS"] = 20
+cfg["SOLVER"]["WARMUP_FACTOR"] = 0.001
+cfg["SOLVER"]["WARMUP_METHOD"] = "linear"
+cfg["SOLVER"]["MAX_EPOCHS"] = 240
+cfg["SOLVER"]["OUTPUT_DIR"] = "outputs/star_predcls_obb_train_large_long"
+cfg["SOLVER"]["CHECKPOINT_PERIOD"] = 1
+cfg["SOLVER"]["VAL_PERIOD"] = 2
+cfg["SOLVER"]["VAL_START_PERIOD"] = 150
+cfg["SOLVER"]["PRINT_GRAD_FREQ"] = 0
+cfg["SOLVER"]["GRAD_NORM_CLIP"] = 5.0
+cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupMultiStepLR"
+cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "epoch"
+cfg["SOLVER"]["STEPS"] = [120, 160, 180]
+cfg["SOLVER"]["GAMMA"] = 0.1
+cfg["SOLVER"]["SCHEDULE"]["MIN_LR_RATIO"] = 0.0
+cfg["SOLVER"]["SCHEDULE"]["EXP_GAMMA"] = 0.9999
+
+# 可选学习率计划:
+# 1) MultiStep:
+# cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupMultiStepLR"
+# cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "epoch"
+# cfg["SOLVER"]["STEPS"] = [260, 360]
+# cfg["SOLVER"]["GAMMA"] = 0.1
+#
+# 2) Cosine:
+# cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupCosineLR"
+# cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "epoch"
+# cfg["SOLVER"]["SCHEDULE"]["MIN_LR_RATIO"] = 0.01
+#
+# 3) Linear Decay:
+# cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupLinearDecayLR"
+# cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "epoch"
+# cfg["SOLVER"]["SCHEDULE"]["MIN_LR_RATIO"] = 0.05
+#
+# 4) Exponential:
+# cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupExponentialLR"
+# cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "iter"
+# cfg["SOLVER"]["SCHEDULE"]["EXP_GAMMA"] = 0.9999
+#
+# 5) Plateau:
+# cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupReduceLROnPlateau"
+# cfg["SOLVER"]["SCHEDULE"]["FACTOR"] = 0.5
+# cfg["SOLVER"]["SCHEDULE"]["PATIENCE"] = 2
+# cfg["SOLVER"]["SCHEDULE"]["THRESHOLD"] = 1e-4
+# cfg["SOLVER"]["SCHEDULE"]["COOLDOWN"] = 0
+#
+# 6) Constant:
+# cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "none"
+
+cfg["TEST"]["RECALL_AT"] = [1500, 2000]
+cfg["TEST"]["EVAL_DEBUG"] = {
+    "ENABLED": True,
+    "TOP_PREDICATES": 10,
+    "TOP_IMAGES": 10,
+}
+cfg["TEST"]["PATCH_AUTO_ENABLED"] = True
+cfg["TEST"]["PATCH_AUTO_MIN_SIZE"] = 1024
+cfg["TEST"]["PATCH_MAX_PYRAMID_LAYERS"] = 16
+cfg["TEST"]["PATCH_BATCH_SIZE"] = 2
+cfg["TEST"]["PATCH_BATCH_SIZE_LARGE"] = 4
+cfg["TEST"]["PATCH_GAPS"] = [200]
+cfg["TEST"]["PATCH_SIZE"] = [1024, 1024]
+cfg["TEST"]["PATCH_SCORE_THRESHOLDS"] = [0.3, 0.2, 0.1, 0.001, 0.00001]
+cfg["mbs"] = 512
+cfg["feat_update_step"] = 2
+
+for split in ("TRAIN", "VAL", "TEST"):
+    cfg["DATASETS"][split]["NAME"] = "star"
+    cfg["DATASETS"][split]["IMAGE_ROOT"] = f"{DATA_ROOT}/STAR_img"
+    cfg["DATASETS"][split]["ROIDB_FILE"] = f"{DATA_ROOT}/STAR-SGG-with-attri.h5"
+    cfg["DATASETS"][split]["DICT_FILE"] = f"{DATA_ROOT}/STAR-SGG-dicts-with-attri.json"
+    cfg["DATASETS"][split]["IMAGE_FILE"] = f"{DATA_ROOT}/STAR_image_data_v1.json"
+    cfg["DATASETS"][split]["FILTER_EMPTY_RELATIONS"] = True
+    cfg["DATASETS"][split]["FILTER_DUPLICATE_RELATIONS"] = True
+    cfg["DATASETS"][split]["FILTER_NON_OVERLAP"] = False
+    cfg["DATASETS"][split]["SPLIT_MODE"] = "fixed"
+    cfg["DATASETS"][split]["IMAGE_EXT"] = ".png"
+    cfg["DATASETS"][split]["IMAGE_SIZE"] = [1024, 1024]
+    cfg["DATASETS"][split]["PIXEL_MEAN"] = [123.675, 116.28, 103.53]
+    cfg["DATASETS"][split]["PIXEL_STD"] = [58.395, 57.12, 57.375]
+    cfg["DATASETS"][split]["TO_RGB"] = True
+    cfg["DATASETS"][split]["AUGMENT"] = split == "TRAIN"

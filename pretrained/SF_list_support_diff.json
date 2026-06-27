@@ -1,0 +1,525 @@
+{
+  "shape": [
+    49,
+    49,
+    59
+  ],
+  "current_support_entries": 463,
+  "new_support_entries": 585,
+  "overlap_entries": 463,
+  "only_current_entries": 0,
+  "only_new_entries": 122,
+  "union_entries": 585,
+  "jaccard": 0.7914529914529914,
+  "current_coverage_by_new": 1.0,
+  "new_coverage_by_current": 0.7914529914529914,
+  "top_support_diff_entries": [
+    {
+      "head_idx": 1,
+      "tail_idx": 1,
+      "predicate_idx": 7,
+      "head_name": "ship",
+      "tail_name": "ship",
+      "predicate_name": "randomly docked at",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 1,
+      "tail_idx": 1,
+      "predicate_idx": 29,
+      "head_name": "ship",
+      "tail_name": "ship",
+      "predicate_name": "approach",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 1,
+      "tail_idx": 1,
+      "predicate_idx": 30,
+      "head_name": "ship",
+      "tail_name": "ship",
+      "predicate_name": "away from",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 1,
+      "tail_idx": 4,
+      "predicate_idx": 8,
+      "head_name": "ship",
+      "tail_name": "goods_yard",
+      "predicate_name": "docking at the same dock with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 1,
+      "tail_idx": 7,
+      "predicate_idx": 8,
+      "head_name": "ship",
+      "tail_name": "breakwater",
+      "predicate_name": "docking at the same dock with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 1,
+      "tail_idx": 8,
+      "predicate_idx": 16,
+      "head_name": "ship",
+      "tail_name": "dock",
+      "predicate_name": "adjacent",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 1,
+      "tail_idx": 8,
+      "predicate_idx": 36,
+      "head_name": "ship",
+      "tail_name": "dock",
+      "predicate_name": "not docked alongside with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 1,
+      "predicate_idx": 7,
+      "head_name": "boat",
+      "tail_name": "ship",
+      "predicate_name": "randomly docked at",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 1,
+      "predicate_idx": 30,
+      "head_name": "boat",
+      "tail_name": "ship",
+      "predicate_name": "away from",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 1,
+      "predicate_idx": 40,
+      "head_name": "boat",
+      "tail_name": "ship",
+      "predicate_name": "docking at the same breakwater with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 2,
+      "predicate_idx": 2,
+      "head_name": "boat",
+      "tail_name": "boat",
+      "predicate_name": "isolatedly docked at",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 3,
+      "predicate_idx": 7,
+      "head_name": "boat",
+      "tail_name": "crane",
+      "predicate_name": "randomly docked at",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 3,
+      "predicate_idx": 36,
+      "head_name": "boat",
+      "tail_name": "crane",
+      "predicate_name": "not docked alongside with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 7,
+      "predicate_idx": 8,
+      "head_name": "boat",
+      "tail_name": "breakwater",
+      "predicate_name": "docking at the same dock with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 8,
+      "predicate_idx": 16,
+      "head_name": "boat",
+      "tail_name": "dock",
+      "predicate_name": "adjacent",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 2,
+      "tail_idx": 8,
+      "predicate_idx": 36,
+      "head_name": "boat",
+      "tail_name": "dock",
+      "predicate_name": "not docked alongside with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 3,
+      "tail_idx": 4,
+      "predicate_idx": 16,
+      "head_name": "crane",
+      "tail_name": "goods_yard",
+      "predicate_name": "adjacent",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 4,
+      "tail_idx": 1,
+      "predicate_idx": 4,
+      "head_name": "goods_yard",
+      "tail_name": "ship",
+      "predicate_name": "over",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 4,
+      "tail_idx": 3,
+      "predicate_idx": 4,
+      "head_name": "goods_yard",
+      "tail_name": "crane",
+      "predicate_name": "over",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 4,
+      "tail_idx": 8,
+      "predicate_idx": 3,
+      "head_name": "goods_yard",
+      "tail_name": "dock",
+      "predicate_name": "connect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 5,
+      "tail_idx": 2,
+      "predicate_idx": 5,
+      "head_name": "tank",
+      "tail_name": "boat",
+      "predicate_name": "co-storage with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 5,
+      "tail_idx": 3,
+      "predicate_idx": 4,
+      "head_name": "tank",
+      "tail_name": "crane",
+      "predicate_name": "over",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 5,
+      "tail_idx": 5,
+      "predicate_idx": 26,
+      "head_name": "tank",
+      "tail_name": "tank",
+      "predicate_name": "around",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 5,
+      "tail_idx": 28,
+      "predicate_idx": 27,
+      "head_name": "tank",
+      "tail_name": "substation",
+      "predicate_name": "not co-storage with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 5,
+      "tail_idx": 48,
+      "predicate_idx": 5,
+      "head_name": "tank",
+      "tail_name": "containment_vessel",
+      "predicate_name": "co-storage with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 5,
+      "tail_idx": 48,
+      "predicate_idx": 27,
+      "head_name": "tank",
+      "tail_name": "containment_vessel",
+      "predicate_name": "not co-storage with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 6,
+      "tail_idx": 3,
+      "predicate_idx": 4,
+      "head_name": "storehouse",
+      "tail_name": "crane",
+      "predicate_name": "over",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 6,
+      "tail_idx": 4,
+      "predicate_idx": 4,
+      "head_name": "storehouse",
+      "tail_name": "goods_yard",
+      "predicate_name": "over",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 6,
+      "tail_idx": 20,
+      "predicate_idx": 16,
+      "head_name": "storehouse",
+      "tail_name": "bridge",
+      "predicate_name": "adjacent",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 7,
+      "tail_idx": 7,
+      "predicate_idx": 37,
+      "head_name": "breakwater",
+      "tail_name": "breakwater",
+      "predicate_name": "driving in the opposite direction with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 8,
+      "tail_idx": 1,
+      "predicate_idx": 3,
+      "head_name": "dock",
+      "tail_name": "ship",
+      "predicate_name": "connect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 8,
+      "tail_idx": 3,
+      "predicate_idx": 16,
+      "head_name": "dock",
+      "tail_name": "crane",
+      "predicate_name": "adjacent",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 8,
+      "tail_idx": 8,
+      "predicate_idx": 19,
+      "head_name": "dock",
+      "tail_name": "dock",
+      "predicate_name": "intersect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 10,
+      "predicate_idx": 21,
+      "head_name": "airplane",
+      "tail_name": "boarding_bridge",
+      "predicate_name": "parking in the same apron with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 12,
+      "predicate_idx": 3,
+      "head_name": "airplane",
+      "tail_name": "taxiway",
+      "predicate_name": "connect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 12,
+      "predicate_idx": 23,
+      "head_name": "airplane",
+      "tail_name": "taxiway",
+      "predicate_name": "parked alongside with",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 12,
+      "predicate_idx": 26,
+      "head_name": "airplane",
+      "tail_name": "taxiway",
+      "predicate_name": "around",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 13,
+      "predicate_idx": 3,
+      "head_name": "airplane",
+      "tail_name": "terminal",
+      "predicate_name": "connect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 13,
+      "predicate_idx": 29,
+      "head_name": "airplane",
+      "tail_name": "terminal",
+      "predicate_name": "approach",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 14,
+      "predicate_idx": 3,
+      "head_name": "airplane",
+      "tail_name": "apron",
+      "predicate_name": "connect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 14,
+      "predicate_idx": 20,
+      "head_name": "airplane",
+      "tail_name": "apron",
+      "predicate_name": "not run along",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 9,
+      "tail_idx": 14,
+      "predicate_idx": 26,
+      "head_name": "airplane",
+      "tail_name": "apron",
+      "predicate_name": "around",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 10,
+      "tail_idx": 5,
+      "predicate_idx": 3,
+      "head_name": "boarding_bridge",
+      "tail_name": "tank",
+      "predicate_name": "connect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 10,
+      "tail_idx": 9,
+      "predicate_idx": 4,
+      "head_name": "boarding_bridge",
+      "tail_name": "airplane",
+      "predicate_name": "over",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 10,
+      "tail_idx": 10,
+      "predicate_idx": 3,
+      "head_name": "boarding_bridge",
+      "tail_name": "boarding_bridge",
+      "predicate_name": "connect",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 10,
+      "tail_idx": 13,
+      "predicate_idx": 4,
+      "head_name": "boarding_bridge",
+      "tail_name": "terminal",
+      "predicate_name": "over",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 11,
+      "tail_idx": 9,
+      "predicate_idx": 15,
+      "head_name": "runway",
+      "tail_name": "airplane",
+      "predicate_name": "run along",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 11,
+      "tail_idx": 9,
+      "predicate_idx": 29,
+      "head_name": "runway",
+      "tail_name": "airplane",
+      "predicate_name": "approach",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 11,
+      "tail_idx": 11,
+      "predicate_idx": 16,
+      "head_name": "runway",
+      "tail_name": "runway",
+      "predicate_name": "adjacent",
+      "in_current": false,
+      "in_new": true
+    },
+    {
+      "head_idx": 11,
+      "tail_idx": 11,
+      "predicate_idx": 18,
+      "head_name": "runway",
+      "tail_name": "runway",
+      "predicate_name": "converge",
+      "in_current": false,
+      "in_new": true
+    }
+  ],
+  "split": "all",
+  "split_mode": "fixed",
+  "num_images_used": 1280,
+  "num_images_with_relations": 1280,
+  "num_relations_used": 404592,
+  "current_sf_path": "pretrained/SF_list.json",
+  "output_support_path": "pretrained/SF_list_support.json"
+}
