@@ -1990,6 +1990,10 @@ class QueryHierarchyRelationPredictor(nn.Module):
 
 def make_roi_relation_predictor(cfg: dict, in_channels: int):
     predictor_name = str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICTOR", default="Placeholder")).upper()
+    if predictor_name in {"TYPED_HYPER_RPCM", "TYPED_RPCM"}:
+        from sgg.modeling.roi_heads.typed_hyper_rpcm import TypedHyperRPCM
+
+        return TypedHyperRPCM(cfg, in_channels)
     if predictor_name in {"HIER_SUBGRAPH", "QUERY_HIERARCHY", "QHSG"}:
         return QueryHierarchyRelationPredictor(cfg, in_channels)
     if predictor_name == "RPCM":

@@ -61,6 +61,17 @@ def parse_args():
         default="",
         help="Optional JSON file to save metrics.",
     )
+    parser.add_argument(
+        "--filter-method",
+        choices=("NONE", "PPG", "PPN"),
+        default=None,
+        help="Optional runtime override for the configured pair filter.",
+    )
+    parser.add_argument(
+        "--pair-filter-checkpoint",
+        default="",
+        help="Checkpoint override for the selected PPG/PPN filter.",
+    )
     return parser.parse_args()
 
 
@@ -70,6 +81,29 @@ def main():
     cfg = get_default_cfg()
     cfg = load_py_config(args.config)
     apply_runtime_cfg(cfg)
+
+    rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
+    if args.filter_method is not None:
+        rel_cfg["TEST_FILTER_METHOD"] = args.filter_method
+    if args.pair_filter_checkpoint:
+        if str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper() == "PPN":
+            rel_cfg["PPN_MODEL_PATH"] = args.pair_filter_checkpoint
+        elif str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper() == "PPG":
+            rel_cfg["PPG_MODEL_PATH_OBB"] = args.pair_filter_checkpoint
+        else:
+            raise ValueError("--pair-filter-checkpoint requires --filter-method PPN or PPG")
+    filter_method = str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper()
+    filter_path = (
+        rel_cfg.get("PPN_MODEL_PATH", "")
+        if filter_method == "PPN"
+        else rel_cfg.get("PPG_MODEL_PATH_OBB", "")
+        if filter_method == "PPG"
+        else ""
+    )
+    print(
+        f"Resolved pair filter: method={filter_method}, checkpoint={filter_path or '<none>'}",
+        flush=True,
+    )
 
     split = args.split.lower()
     datasets = build_datasets(cfg, splits=(split,))

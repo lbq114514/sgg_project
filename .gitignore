@@ -26,6 +26,7 @@ exit_code.txt
 cmdlines.txt
 
 # Model weights and large experiment artifacts
+glove/
 *.pth
 *.pt
 *.ckpt
@@ -40,3 +41,4 @@ top_mistaken_predicates_*.json
 .agents/
 .codex
 .codex/
+glove/

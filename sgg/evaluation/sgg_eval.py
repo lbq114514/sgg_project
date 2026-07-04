@@ -38,6 +38,8 @@ class SGGResult:
     predicate_gt_pair_cls_covered: Dict[int, int] = field(default_factory=dict)
     predicate_gt_pair_cls_accuracy: Dict[int, Dict[int, float]] = field(default_factory=dict)
     predicate_pair_cls_confusion: Dict[int, Dict[int, int]] = field(default_factory=dict)
+    candidate_stage_coverage: Dict[str, float] = field(default_factory=dict)
+    predicate_candidate_stage_coverage: Dict[str, Dict[int, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -514,6 +516,10 @@ def evaluate_sgg(
     zeroshot_metric = _ZeroShotRecallMetric(topk) if "zR" in enabled else None
     ng_zeroshot_metric = _ZeroShotRecallMetric(topk) if "ng-zR" in enabled else None
     pair_accuracy_metric = _PairAccuracyMetric(topk) if "A" in enabled else None
+    candidate_stage_hits = {"semantic": 0, "ppn": 0, "degree_cap": 0, "final": 0}
+    predicate_candidate_hits = {stage: {} for stage in candidate_stage_hits}
+    predicate_candidate_total: Dict[int, int] = {}
+    candidate_stage_total = 0
 
     for pred, target in zip(predictions, targets):
         ctx = _build_image_context(pred, target, mode)
@@ -521,6 +527,41 @@ def evaluate_sgg(
             continue
 
         valid_images += 1
+        gt_rows = ctx.gt_rels.tolist()
+        candidate_stage_total += len(gt_rows)
+        for row in gt_rows:
+            predicate = int(row[2])
+            predicate_candidate_total[predicate] = predicate_candidate_total.get(predicate, 0) + 1
+        if pred.has_field("semantic_allowed_label_pairs"):
+            allowed = pred.get_field("semantic_allowed_label_pairs").bool().reshape(
+                pred.get_field("semantic_allowed_label_pairs").shape[-2:]
+            )
+            for row in gt_rows:
+                hit = bool(allowed[int(ctx.gt_labels[int(row[0])]), int(ctx.gt_labels[int(row[1])])])
+                candidate_stage_hits["semantic"] += int(hit)
+                if hit:
+                    predicate = int(row[2])
+                    predicate_candidate_hits["semantic"][predicate] = predicate_candidate_hits["semantic"].get(predicate, 0) + 1
+        stage_fields = {
+            "ppn": "ppn_ranked_pair_idxs",
+            "degree_cap": "degree_capped_pair_idxs",
+        }
+        for stage, field_name in stage_fields.items():
+            if pred.has_field(field_name):
+                stage_pairs = {tuple(pair) for pair in pred.get_field(field_name).long().tolist()}
+                for row in gt_rows:
+                    hit = (int(row[0]), int(row[1])) in stage_pairs
+                    candidate_stage_hits[stage] += int(hit)
+                    if hit:
+                        predicate = int(row[2])
+                        predicate_candidate_hits[stage][predicate] = predicate_candidate_hits[stage].get(predicate, 0) + 1
+        final_pairs = {tuple(pair) for pair in ctx.pred_pair_idx.tolist()}
+        for row in gt_rows:
+            hit = (int(row[0]), int(row[1])) in final_pairs
+            candidate_stage_hits["final"] += int(hit)
+            if hit:
+                predicate = int(row[2])
+                predicate_candidate_hits["final"][predicate] = predicate_candidate_hits["final"].get(predicate, 0) + 1
         for _, _, predicate in ctx.gt_rels.tolist():
             predicate = int(predicate)
             predicate_counts[predicate] = predicate_counts.get(predicate, 0) + 1
@@ -595,4 +636,15 @@ def evaluate_sgg(
         zero_shot_recall=zeroshot_metric.finalize() if zeroshot_metric is not None else {},
         ng_zero_shot_recall=ng_zeroshot_metric.finalize() if ng_zeroshot_metric is not None else {},
         pair_accuracy=pair_accuracy_metric.finalize() if pair_accuracy_metric is not None else {},
+        candidate_stage_coverage={
+            stage: float(hits / max(candidate_stage_total, 1))
+            for stage, hits in candidate_stage_hits.items()
+        },
+        predicate_candidate_stage_coverage={
+            stage: {
+                int(predicate): float(hits.get(predicate, 0) / max(total, 1))
+                for predicate, total in predicate_candidate_total.items()
+            }
+            for stage, hits in predicate_candidate_hits.items()
+        },
     )

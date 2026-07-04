@@ -38,6 +38,10 @@ def main():
     parser.add_argument("--config", type=str, required=False)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--resume", type=str, default="")
+    parser.add_argument(
+        "--init-rpcm", type=str, default="",
+        help="Initialize compatible TypedHyperRPCM blocks from an RPCM checkpoint.",
+    )
     parser.add_argument("--start-epoch", type=int, default=None, help="Epoch index to resume from, 0-based. Defaults to checkpoint epoch.")
     parser.add_argument("--resume-step", type=int, default=None, help="Override global training step after loading a checkpoint.")
     args = parser.parse_args()
@@ -68,6 +72,11 @@ def main():
     )
     trainer = Trainer(cfg, model, device=args.device, dataloaders=dataloaders)
     start_epoch = 0
+    init_modes = sum(bool(value) for value in (args.init_rpcm, args.resume))
+    if init_modes > 1:
+        raise ValueError("--init-rpcm and --resume are mutually exclusive")
+    if args.init_rpcm:
+        trainer.load_rpcm_predictor_weights(args.init_rpcm)
     if args.resume:
         ckpt = trainer.load_checkpoint(args.resume)
         if isinstance(ckpt, dict) and "epoch" in ckpt:

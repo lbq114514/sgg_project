@@ -81,7 +81,7 @@ def _prepare_relation_forward(model, relation_head, features, images, targets):
         filtered = pair_idx
         if proposal.has_field("labels"):
             filtered = relation_head.sema_filter.filter_pairs(filtered, proposal.get_field("labels").long())
-        if relation_head.ppg.enabled and relation_head.ppg.filter_method == "PPG":
+        if relation_head.ppg.enabled and relation_head.ppg.filter_method in {"PPG", "PPN"}:
             filtered = relation_head.ppg.filter_pairs(proposal, filtered)
         final_pair_idxs.append(filtered)
 

@@ -194,7 +194,9 @@ class PairProposalGenerator(nn.Module):
             return torch.zeros((0,), dtype=torch.long, device=device)
         losses = torch.cat(loss_chunks, dim=0)
         keep_k = min(int(losses.numel()), self.topk)
-        keep = losses.topk(keep_k, largest=False, sorted=False).indices
+        # Keep reconstruction-loss order so one max-k run can serve multiple
+        # evaluation cutoffs without recomputing expensive OBB features.
+        keep = losses.topk(keep_k, largest=False, sorted=True).indices
         return keep.to(device=device, dtype=torch.long)
 
     def _one_hot_labels(self, labels: torch.Tensor, device: torch.device) -> torch.Tensor:

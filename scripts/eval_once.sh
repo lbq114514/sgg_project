@@ -11,6 +11,8 @@ CHECKPOINT="${CHECKPOINT:-outputs/star_predcls_obb_train_large_long/model_last.p
 SPLIT="${SPLIT:-test}"
 DEVICE="${DEVICE:-cuda}"
 LOG_FILE="${LOG_FILE:-star_eval_once.log}"
+FILTER_METHOD="${FILTER_METHOD:-}"
+PAIR_FILTER_CHECKPOINT="${PAIR_FILTER_CHECKPOINT:-}"
 
 cd "${ROOT_DIR}"
 
@@ -34,6 +36,13 @@ cmd=(
   --split "${SPLIT}"
   --device "${DEVICE}"
 )
+
+if [[ -n "${FILTER_METHOD}" ]]; then
+  cmd+=(--filter-method "${FILTER_METHOD}")
+fi
+if [[ -n "${PAIR_FILTER_CHECKPOINT}" ]]; then
+  cmd+=(--pair-filter-checkpoint "${PAIR_FILTER_CHECKPOINT}")
+fi
 
 nohup "${cmd[@]}" > "${LOG_FILE}" 2>&1 &
 

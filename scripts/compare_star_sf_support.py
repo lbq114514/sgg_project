@@ -15,7 +15,12 @@ if str(ROOT) not in sys.path:
 from sgg.data.sources.star import STARSource
 
 
-DATA_ROOT = Path(os.environ.get("STAR_SGG_ROOT", "data/STAR_SGG"))
+DATA_ROOT = Path(
+    os.environ.get(
+        "STAR_SGG_ROOT",
+        "/home/ubuntu/research/ssd/RSDatasets/STAR_SGG",
+    )
+)
 
 
 def parse_args():

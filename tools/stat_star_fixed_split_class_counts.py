@@ -15,7 +15,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-DEFAULT_DATA_ROOT = Path(os.environ.get("STAR_SGG_ROOT", "data/STAR_SGG"))
+DEFAULT_DATA_ROOT = Path(
+    os.environ.get(
+        "STAR_SGG_ROOT",
+        "/home/ubuntu/research/ssd/RSDatasets/STAR_SGG",
+    )
+)
 
 
 def load_fixed_split_indices() -> Tuple[List[int], List[int], List[int]]:

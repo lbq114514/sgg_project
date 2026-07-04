@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sgg.modeling.roi_heads.ppg import PairProposalGenerator
+from sgg.modeling.roi_heads.pair_proposal_network import PairProposalNetworkFilter
+from sgg.modeling.roi_heads.pair_graph_builder import PairGraphBuilder
 from sgg.modeling.roi_heads.relation_inference import make_roi_relation_post_processor
 from sgg.modeling.roi_heads.relation_loss import make_roi_relation_loss_evaluator
 from sgg.modeling.roi_heads.relation_sampling import make_roi_relation_samp_processor
@@ -57,7 +59,12 @@ class ROIRelationHead(nn.Module):
         self.post_processor = make_roi_relation_post_processor(cfg)
         self.loss_evaluator = make_roi_relation_loss_evaluator(cfg)
         self.samp_processor = make_roi_relation_samp_processor(cfg)
-        self.ppg = PairProposalGenerator(cfg)
+        filter_method = str(cfg["MODEL"]["ROI_RELATION_HEAD"].get("TEST_FILTER_METHOD", "NONE")).upper()
+        self.ppg = (
+            PairProposalNetworkFilter(cfg)
+            if filter_method == "PPN"
+            else PairProposalGenerator(cfg)
+        )
         self.sema_filter = SemanticPairFilter(cfg)
         rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
         self.type = cfg.get("TYPE", "CV")
@@ -65,6 +72,13 @@ class ROIRelationHead(nn.Module):
         self.use_gt_box = bool(rel_cfg.get("USE_GT_BOX", False))
         self.use_gt_object_label = bool(rel_cfg.get("USE_GT_OBJECT_LABEL", False))
         self.predictor_name = str(rel_cfg.get("PREDICTOR", ""))
+        self.use_typed_pair_graph = self.predictor_name.upper() in {
+            "TYPED_HYPER_RPCM", "TYPED_RPCM"
+        }
+        self.pair_graph_builder = (
+            PairGraphBuilder(cfg, self.ppg, self.sema_filter)
+            if self.use_typed_pair_graph else None
+        )
         self.num_obj_classes = int(cfg["MODEL"]["ROI_BOX_HEAD"]["NUM_CLASSES"])
 
     def _feature_device(self, features) -> torch.device:
@@ -103,28 +117,43 @@ class ROIRelationHead(nn.Module):
         del s_f, kwargs
         if self.training:
             with torch.no_grad():
-                if self.use_gt_box:
+                if self.use_typed_pair_graph:
+                    rel_pair_idxs, rel_labels, _ = self.pair_graph_builder.build(
+                        proposals, targets=targets, training=True
+                    )
+                    rel_binarys = None
+                elif self.use_gt_box:
                     proposals, rel_labels, rel_pair_idxs, rel_binarys = self.samp_processor.gtbox_relsample(proposals, targets)
                 else:
                     proposals, rel_labels, rel_pair_idxs, rel_binarys = self.samp_processor.detect_relsample(proposals, targets)
         else:
             rel_labels, rel_binarys = None, None
-            rel_pair_idxs = self.samp_processor.prepare_test_pairs(self._feature_device(features), proposals)
-            for proposal, pair_idx in zip(proposals, rel_pair_idxs):
-                proposal.add_field("base_rel_pair_idxs", pair_idx)
-            filtered_pair_idxs = []
-            for proposal, pair_idx in zip(proposals, rel_pair_idxs):
-                if proposal.has_field("labels"):
-                    pair_idx = self.sema_filter.filter_pairs(pair_idx, proposal.get_field("labels").long())
-                if self.ppg.enabled and self.ppg.filter_method == "PPG":
-                    filtered_pair_idx = self.ppg.filter_pairs(proposal, pair_idx)
-                else:
-                    filtered_pair_idx = pair_idx
-                filtered_pair_idxs.append(filtered_pair_idx)
-                proposal.add_field("pruned_rel_pair_idxs", filtered_pair_idx)
-            rel_pair_idxs = filtered_pair_idxs
+            if self.use_typed_pair_graph:
+                rel_pair_idxs, _, _ = self.pair_graph_builder.build(
+                    proposals, targets=None, training=False
+                )
+                for proposal, pair_idx in zip(proposals, rel_pair_idxs):
+                    proposal.add_field("base_rel_pair_idxs", pair_idx)
+                    proposal.add_field("pruned_rel_pair_idxs", pair_idx)
+            else:
+                rel_pair_idxs = self.samp_processor.prepare_test_pairs(self._feature_device(features), proposals)
+                for proposal, pair_idx in zip(proposals, rel_pair_idxs):
+                    proposal.add_field("base_rel_pair_idxs", pair_idx)
+                filtered_pair_idxs = []
+                for proposal, pair_idx in zip(proposals, rel_pair_idxs):
+                    if proposal.has_field("labels"):
+                        pair_idx = self.sema_filter.filter_pairs(pair_idx, proposal.get_field("labels").long())
+                    if self.ppg.enabled and self.ppg.filter_method in {"PPG", "PPN"}:
+                        filtered_pair_idx = self.ppg.filter_pairs(proposal, pair_idx)
+                    else:
+                        filtered_pair_idx = pair_idx
+                    filtered_pair_idxs.append(filtered_pair_idx)
+                    proposal.add_field("pruned_rel_pair_idxs", filtered_pair_idx)
+                rel_pair_idxs = filtered_pair_idxs
 
-        if self.use_gt_box and self.use_gt_object_label and self.predictor_name == "RPCM":
+        if self.use_gt_box and self.use_gt_object_label and (
+            self.predictor_name == "RPCM" or self.use_typed_pair_graph
+        ):
             for proposal in proposals:
                 labels = proposal.get_field("labels").long().clamp(min=0, max=self.num_obj_classes)
                 predict_logits = _to_onehot_logits(labels, num_classes=self.num_obj_classes + 1)
@@ -177,9 +206,7 @@ class ROIRelationHead(nn.Module):
             relation_logits,
             refine_logits=refine_logits,
         )
-        output_losses = {
-            "loss_rel": loss_relation,
-        }
+        output_losses = {"loss_rel": loss_relation}
         if loss_refine_obj is not None:
             output_losses["loss_refine_obj"] = loss_refine_obj
         output_losses.update(add_losses)

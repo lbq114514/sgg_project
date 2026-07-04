@@ -863,7 +863,32 @@ class Trainer:
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
         state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-        self.model.load_state_dict(state_dict)
+        incompatible = self.model.load_state_dict(state_dict, strict=False)
+        filter_prefixes = (
+            "roi_heads.relation.ppg.",
+            "roi_heads.relation.ppn.",
+        )
+        missing = [
+            key for key in incompatible.missing_keys
+            if not key.startswith(filter_prefixes)
+        ]
+        unexpected = [
+            key for key in incompatible.unexpected_keys
+            if not key.startswith(filter_prefixes)
+        ]
+        if missing or unexpected:
+            raise RuntimeError(
+                "Checkpoint is incompatible with the model outside the independent "
+                f"pair filter: missing_keys={missing}, unexpected_keys={unexpected}"
+            )
+        ignored_missing = len(incompatible.missing_keys) - len(missing)
+        ignored_unexpected = len(incompatible.unexpected_keys) - len(unexpected)
+        if ignored_missing or ignored_unexpected:
+            print(
+                "Checkpoint pair-filter state ignored:",
+                {"missing": ignored_missing, "unexpected": ignored_unexpected},
+                flush=True,
+            )
         if isinstance(ckpt, dict) and "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         if isinstance(ckpt, dict) and ckpt.get("scheduler") is not None and hasattr(self.scheduler, "load_state_dict"):
@@ -871,6 +896,80 @@ class Trainer:
         if isinstance(ckpt, dict) and "global_step" in ckpt:
             self.global_step = int(ckpt["global_step"])
         return ckpt
+
+    def load_rpcm_predictor_weights(self, path: str):
+        """Initialize the compatible TypedHyperRPCM blocks from an RPCM checkpoint."""
+        ckpt = torch.load(path, map_location="cpu")
+        source = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        target = self.model.state_dict()
+        predictor_prefix = "roi_heads.relation.predictor."
+        shared_prefixes = (
+            "pairwise_feature_extractor.",
+            "down_samp.",
+            "rel_residual.",
+            "rel_norm.",
+            "proto_head.",
+        )
+        loaded, shape_mismatch, absent = [], [], []
+        update = {}
+        # Everything outside the predictor must migrate strictly. This includes
+        # the detector, ROI/union extractors and relation post-processing state.
+        ignored_external_prefixes = ("roi_heads.relation.ppg.", "roi_heads.relation.ppn.")
+        external_missing = []
+        for key, target_value in target.items():
+            if key.startswith(predictor_prefix) or key.startswith(ignored_external_prefixes):
+                continue
+            if key not in source:
+                external_missing.append(key)
+            elif source[key].shape != target_value.shape:
+                shape_mismatch.append((key, tuple(source[key].shape), tuple(target_value.shape)))
+            else:
+                update[key] = source[key]
+                loaded.append(key)
+        external_unexpected = [
+            key for key in source
+            if not key.startswith(predictor_prefix)
+            and not key.startswith(ignored_external_prefixes)
+            and key not in target
+        ]
+        if external_missing or external_unexpected or any(not key.startswith(predictor_prefix) for key, _, _ in shape_mismatch):
+            raise RuntimeError(
+                "RPCM checkpoint is incompatible outside the predictor: "
+                f"missing={external_missing}, unexpected={external_unexpected}, "
+                f"shape_mismatch={shape_mismatch}"
+            )
+        for key, value in source.items():
+            if not key.startswith(predictor_prefix):
+                continue
+            local_key = key[len(predictor_prefix):]
+            if not local_key.startswith(shared_prefixes):
+                continue
+            if key not in target:
+                absent.append(key)
+            elif target[key].shape != value.shape:
+                shape_mismatch.append((key, tuple(value.shape), tuple(target[key].shape)))
+            else:
+                update[key] = value
+                loaded.append(key)
+        if not any(key.startswith(predictor_prefix) for key in loaded):
+            raise RuntimeError(f"No compatible RPCM predictor weights found in {path}")
+        target.update(update)
+        self.model.load_state_dict(target, strict=True)
+        report = {
+            "checkpoint": path,
+            "loaded": loaded,
+            "shape_mismatch": shape_mismatch,
+            "absent_in_target": absent,
+        }
+        print(
+            "RPCM -> TypedHyperRPCM migration:",
+            {"loaded": len(loaded), "shape_mismatch": len(shape_mismatch), "absent": len(absent)},
+            flush=True,
+        )
+        for name in ("shape_mismatch", "absent_in_target"):
+            if report[name]:
+                print(f"  {name}: {report[name]}", flush=True)
+        return report
 
     def _move_targets(self, targets):
         return [t.to(self.device) for t in targets]
@@ -884,37 +983,46 @@ class Trainer:
         train_loader = loaders["train"]
         val_loader = loaders.get("val")
         epochs = self.cfg["SOLVER"]["MAX_EPOCHS"]
+        accumulation_steps = max(
+            1, int(self.cfg.get("SOLVER", {}).get("GRADIENT_ACCUMULATION_STEPS", 1))
+        )
+        optimizer_steps_per_epoch = max(1, (len(train_loader) + accumulation_steps - 1) // accumulation_steps)
         best_recall_k = max(int(k) for k in self.cfg.get("TEST", {}).get("RECALL_AT", [100]))
         if self.warmup_iters <= 0 and self.warmup_epochs > 0:
-            self.warmup_iters = int(round(self.warmup_epochs * len(train_loader)))
+            self.warmup_iters = int(round(self.warmup_epochs * optimizer_steps_per_epoch))
         if not self._scheduler_resolved and self.global_step == 0:
-            self.scheduler = self._build_scheduler(num_iters_per_epoch=len(train_loader))
+            self.scheduler = self._build_scheduler(num_iters_per_epoch=optimizer_steps_per_epoch)
         start_epoch = max(0, min(int(start_epoch), int(epochs)))
         epoch_durations: List[float] = []
         for epoch in range(start_epoch, epochs):
+            # PairGraphBuilder reads this value to apply the GT-injection schedule.
+            self.cfg["_CURRENT_EPOCH"] = epoch + 1
             epoch_start = time.perf_counter()
             self.model.train()
             self._set_frozen_modules_eval()
             epoch_loss_sums: Dict[str, float] = {}
             epoch_loss_count = 0
             pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{epochs}", disable=_disable_tqdm_for_non_tty())
-            for images, targets, _ in pbar:
+            self.optimizer.zero_grad(set_to_none=True)
+            for batch_idx, (images, targets, _) in enumerate(pbar):
                 images = images.to(self.device)
                 targets = self._move_targets(targets)
-                self.optimizer.zero_grad()
                 loss_dict = self.model(images, targets)
                 loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
-                loss.backward()
+                (loss / accumulation_steps).backward()
                 grad_total_norm = None
-                if self.grad_norm_clip > 0:
-                    grad_total_norm = _clip_grad_norm(
-                        self.model.named_parameters(),
-                        max_norm=self.grad_norm_clip,
-                        clip=True,
-                        verbose=self.print_grad_freq > 0 and (self.global_step + 1) % self.print_grad_freq == 0,
-                    )
-                self.optimizer.step()
-                self.global_step += 1
+                should_step = (batch_idx + 1) % accumulation_steps == 0 or batch_idx + 1 == len(train_loader)
+                if should_step:
+                    if self.grad_norm_clip > 0:
+                        grad_total_norm = _clip_grad_norm(
+                            self.model.named_parameters(),
+                            max_norm=self.grad_norm_clip,
+                            clip=True,
+                            verbose=self.print_grad_freq > 0 and (self.global_step + 1) % self.print_grad_freq == 0,
+                        )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.global_step += 1
                 loss_values = {
                     k: float(v.detach().cpu())
                     for k, v in loss_dict.items()
@@ -927,7 +1035,7 @@ class Trainer:
                     epoch_loss_sums[key] = epoch_loss_sums.get(key, 0.0) + value
                 epoch_loss_count += 1
                 pbar.set_postfix(loss_values)
-                if isinstance(
+                if should_step and isinstance(
                     self.scheduler,
                     (WarmupMultiStepLR, WarmupCosineLR, WarmupLinearDecayLR, WarmupExponentialLR, NoOpLR),
                 ):
@@ -1053,10 +1161,29 @@ class Trainer:
             mean_recall_value = res.mean_recall.get(k, 0.0)
             denom = recall_value + mean_recall_value
             harmonic_recall[k] = 0.0 if denom <= 0 else float(2.0 * recall_value * mean_recall_value / denom)
+        family_predicates = (
+            (3, 4, 16, 17, 18, 19, 26, 47, 49, 54),
+            (8, 21, 28, 34, 39, 40, 51),
+            (10, 22, 25, 32, 35, 38, 50),
+            (1, 2, 5, 6, 7, 9, 12, 13, 14, 23, 24, 27, 31, 33, 36),
+            (11, 15, 20, 29, 30, 37, 41, 46, 48),
+            (42, 43, 44, 45, 52, 53, 55, 56, 57, 58),
+        )
+        family_macro_recall = {}
+        for k, per_predicate in res.per_predicate_recall.items():
+            family_values = []
+            for predicates in family_predicates:
+                observed = [float(per_predicate[p]) for p in predicates if res.predicate_counts.get(p, 0) > 0]
+                if observed:
+                    family_values.append(sum(observed) / len(observed))
+            family_macro_recall[k] = sum(family_values) / len(family_values) if family_values else 0.0
         metrics = {
             "R": res.recall,
             "mR": res.mean_recall,
             "HR": harmonic_recall,
+            "family_macro_recall": family_macro_recall,
+            "candidate-stage-coverage": res.candidate_stage_coverage,
+            "predicate-candidate-stage-coverage": res.predicate_candidate_stage_coverage,
             "A": res.pair_accuracy if self.cfg["MODEL"]["TASK"] != "sgdet" else {},
             "images": res.num_images,
             "valid_images": res.valid_images,
@@ -1069,6 +1196,7 @@ class Trainer:
             predicate_names=predicate_names,
         ):
             print(line, flush=True)
+        print(_format_metric_dict_row("family-mR", family_macro_recall, sorted(family_macro_recall)), flush=True)
         debug_cfg = self.cfg.get("TEST", {}).get("EVAL_DEBUG", {})
         if debug_cfg.get("ENABLED", False):
             best_k = max(int(k) for k in self.cfg["TEST"]["RECALL_AT"])

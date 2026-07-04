@@ -67,7 +67,7 @@ def _prepare_stage_pairs(model, relation_head, features, images, targets):
         labels = _proposal_label_field(proposal)
         if proposal.has_field("labels"):
             sema_pair_idx = relation_head.sema_filter.filter_pairs(base_pair_idx, labels)
-        if relation_head.ppg.enabled and relation_head.ppg.filter_method == "PPG":
+        if relation_head.ppg.enabled and relation_head.ppg.filter_method in {"PPG", "PPN"}:
             final_pair_idx = relation_head.ppg.filter_pairs(proposal, sema_pair_idx)
         else:
             final_pair_idx = sema_pair_idx

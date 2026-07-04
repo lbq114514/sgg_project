@@ -61,6 +61,8 @@ pretrained/
 
 The JSON semantic-filter files are small enough to commit; checkpoint files are ignored by default.
 
+GloVe text embeddings are loaded from `glove/glove.6B.200d.txt`. Pair proposal training uses the converted tensor file `glove/glove.6B.200d.pt`. The local `glove/` directory is excluded from Git because these files are large.
+
 ## Usage
 
 Run the synthetic smoke test without STAR data:
