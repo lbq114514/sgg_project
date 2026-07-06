@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sgg.modeling.core.obb_ops import angle_to_radians, get_boxlist_angle_unit
 from sgg.modeling.roi_heads.roi_relation_predictors import (
     MLP,
     PairwiseFeatureExtractor,
@@ -27,9 +28,32 @@ FAMILY_PREDICATES: Dict[int, Tuple[int, ...]] = {
 }
 
 
-def validate_family_mapping(num_predicates: int = 59) -> torch.Tensor:
+def build_family_predicates(rel_cfg: dict | None = None) -> Dict[int, Tuple[int, ...]]:
+    """Return the typed predicate family map for the current experiment.
+
+    The default map is kept checkpoint-compatible with the original Stage1
+    Typed RPCM.  STAR does not annotate lane/road anchors, so lane predicates
+    can optionally be moved out of the shared/different-anchor families and
+    trained as motion/layout predicates.
+    """
+    families = {int(k): tuple(int(v) for v in values) for k, values in FAMILY_PREDICATES.items()}
+    if not rel_cfg or not bool(rel_cfg.get("TYPED_LANE_AS_MOTION", False)):
+        return families
+
+    lane_predicates = tuple(int(v) for v in rel_cfg.get("TYPED_LANE_PREDICATES", (38, 39)))
+    lane_set = set(lane_predicates)
+    for family in list(families.keys()):
+        if family == 5:
+            continue
+        families[family] = tuple(predicate for predicate in families[family] if predicate not in lane_set)
+    families[5] = tuple(sorted(set(families[5]) | lane_set))
+    return families
+
+
+def validate_family_mapping(num_predicates: int = 59, family_predicates: Dict[int, Tuple[int, ...]] | None = None) -> torch.Tensor:
+    family_predicates = family_predicates or FAMILY_PREDICATES
     mapping = torch.full((num_predicates,), -1, dtype=torch.long)
-    for family, predicates in FAMILY_PREDICATES.items():
+    for family, predicates in family_predicates.items():
         for predicate in predicates:
             if predicate < 0 or predicate >= num_predicates or mapping[predicate] >= 0:
                 raise ValueError(f"Invalid or duplicate predicate in family mapping: {predicate}")
@@ -121,7 +145,8 @@ class TypedHyperRPCM(nn.Module):
         self.num_hyper_layers = int(rel_cfg.get("TYPED_HYPERGRAPH_LAYERS", 2))
         dropout = float(rel_cfg.get("RPCM_DROPOUT", 0.2))
 
-        family_map = validate_family_mapping(self.num_rel_classes)
+        self.family_predicates = build_family_predicates(rel_cfg)
+        family_map = validate_family_mapping(self.num_rel_classes, self.family_predicates)
         self.register_buffer("predicate_to_family", family_map, persistent=True)
         self.pairwise_feature_extractor = PairwiseFeatureExtractor(cfg, in_channels)
         self.down_samp = MLP(self.pooling_dim, self.mlp_dim, self.mlp_dim, 2)
@@ -144,7 +169,7 @@ class TypedHyperRPCM(nn.Module):
         )
         self.network_expert = nn.Sequential(nn.Linear(68, self.graph_dim), nn.GELU(), nn.Linear(self.graph_dim, self.graph_dim))
         self.expert_norm = nn.LayerNorm(self.graph_dim)
-        self.expert_family_gate = nn.Linear(self.graph_dim, len(FAMILY_PREDICATES))
+        self.expert_family_gate = nn.Linear(self.graph_dim, len(self.family_predicates))
 
         self.sparse_layers = nn.ModuleList([
             SparseTypedMessageLayer(self.graph_dim, dropout) for _ in range(self.num_sparse_layers)
@@ -152,10 +177,10 @@ class TypedHyperRPCM(nn.Module):
         self.hyper_layers = nn.ModuleList([
             SparseHypergraphLayer(self.graph_dim, dropout) for _ in range(self.num_hyper_layers)
         ])
-        self.family_head = nn.Linear(self.mlp_dim, len(FAMILY_PREDICATES))
+        self.family_head = nn.Linear(self.mlp_dim, len(self.family_predicates))
         self.fine_heads = nn.ModuleDict({
             str(family): nn.Linear(self.mlp_dim, len(predicates))
-            for family, predicates in FAMILY_PREDICATES.items() if family != 0
+            for family, predicates in self.family_predicates.items() if family != 0
         })
 
         self.family_loss_weight = float(rel_cfg.get("TYPED_FAMILY_LOSS_WEIGHT", 0.5))
@@ -164,6 +189,14 @@ class TypedHyperRPCM(nn.Module):
         self.hierarchy_weight = float(rel_cfg.get("TYPED_HIERARCHY_LOGIT_WEIGHT", 1.0))
         self.proto_logit_weight = float(rel_cfg.get("TYPED_PROTO_LOGIT_WEIGHT", 0.0))
         self.anchor_topk = int(rel_cfg.get("TYPED_ANCHOR_TOPK", 4))
+        self.anchor_exclude_predicates = tuple(int(v) for v in rel_cfg.get("TYPED_ANCHOR_EXCLUDE_PREDICATES", ()))
+        self.vehicle_aux_enabled = bool(rel_cfg.get("TYPED_VEHICLE_AUX_ENABLED", False))
+        self.vehicle_predicates = tuple(int(v) for v in rel_cfg.get(
+            "TYPED_VEHICLE_PREDICATES", (6, 11, 31, 37, 38, 39, 41)
+        ))
+        self.vehicle_predicate_to_col = {predicate: idx for idx, predicate in enumerate(self.vehicle_predicates)}
+        self.vehicle_aux_loss_weight = float(rel_cfg.get("TYPED_VEHICLE_AUX_LOSS_WEIGHT", 0.2))
+        self.vehicle_logit_max_weight = float(rel_cfg.get("TYPED_VEHICLE_LOGIT_MAX_WEIGHT", 0.5))
         self.class_names = list(rel_cfg.get("_OBJECT_CLASS_NAMES", cfg["MODEL"]["ROI_BOX_HEAD"].get("CLASS_NAMES", [])))
         anchor_names = rel_cfg.get("TYPED_ANCHOR_CLASSES", [
             "apron", "dock", "taxiway", "runway", "breakwater", "truck_parking",
@@ -171,6 +204,31 @@ class TypedHyperRPCM(nn.Module):
         ])
         name_to_id = {name: idx for idx, name in enumerate(self.class_names)}
         self.anchor_class_ids = tuple(name_to_id[name] for name in anchor_names if name in name_to_id)
+
+        if self.vehicle_aux_enabled:
+            self.vehicle_label_embed = nn.Embedding(self.num_obj_classes + 1, 16)
+            vehicle_feature_dim = self.mlp_dim + 14 + 6 + 4 + 32
+            self.vehicle_aux_head = nn.Sequential(
+                nn.Linear(vehicle_feature_dim, self.graph_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.graph_dim, len(self.vehicle_predicates)),
+            )
+            self.vehicle_logit_scale = nn.Parameter(torch.tensor(float(rel_cfg.get("TYPED_VEHICLE_LOGIT_INIT", 0.0))))
+            counts = [int(v) for v in rel_cfg.get("PREDICATE_COUNTS", [])]
+            predicate_counts = torch.ones((len(self.vehicle_predicates),), dtype=torch.float32)
+            if counts:
+                for idx, predicate in enumerate(self.vehicle_predicates):
+                    if 0 <= predicate < len(counts):
+                        predicate_counts[idx] = max(float(counts[predicate]), 1.0)
+            max_count = predicate_counts.max().clamp(min=1.0)
+            pos_weight = (max_count / predicate_counts.clamp(min=1.0)).clamp(1.0, 20.0)
+            self.register_buffer("vehicle_pos_weight", pos_weight, persistent=True)
+        else:
+            self.vehicle_label_embed = None
+            self.vehicle_aux_head = None
+            self.vehicle_logit_scale = None
+            self.register_buffer("vehicle_pos_weight", torch.ones((0,), dtype=torch.float32), persistent=False)
 
         relation_names = list(rel_cfg.get("RELATION_NAMES", []))
         self.logic_pairs = self._build_logic_pairs(relation_names)
@@ -208,7 +266,8 @@ class TypedHyperRPCM(nn.Module):
     def _box_data(proposal):
         boxes = proposal.bbox.float()
         if proposal.mode == "xywha":
-            centers, sizes, angles = boxes[:, :2], boxes[:, 2:4].clamp(min=1e-6), boxes[:, 4]
+            centers, sizes = boxes[:, :2], boxes[:, 2:4].clamp(min=1e-6)
+            angles = angle_to_radians(boxes[:, 4], get_boxlist_angle_unit(proposal))
         else:
             boxes = proposal.convert("xyxy").bbox.float()
             centers = (boxes[:, :2] + boxes[:, 2:]) / 2
@@ -271,6 +330,62 @@ class TypedHyperRPCM(nn.Module):
         ), dim=1)
         reliable_anchor = (conf_h > 0.35) & (conf_t > 0.35)
         return experts, same_prob, reliable_anchor, incidence_anchor
+
+    def _vehicle_pair_features(self, proposal, pairs: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        if not self.vehicle_aux_enabled or pairs.numel() == 0:
+            return hidden.new_zeros((0, self.mlp_dim + 56))
+        centers, sizes, angles = self._box_data(proposal)
+        labels = proposal.get_field("labels").long().clamp(0, self.num_obj_classes)
+        h, t = pairs[:, 0].long(), pairs[:, 1].long()
+        delta = centers[t] - centers[h]
+        dist = delta.norm(dim=1).clamp(min=1e-6)
+        area_h, area_t = sizes[h].prod(1).clamp(min=1e-6), sizes[t].prod(1).clamp(min=1e-6)
+        angle_delta = angles[t] - angles[h]
+        geometry = torch.stack((
+            delta[:, 0], delta[:, 1], dist,
+            delta[:, 0] / sizes[h, 0], delta[:, 1] / sizes[h, 1],
+            delta[:, 0] / sizes[t, 0], delta[:, 1] / sizes[t, 1],
+            (sizes[t, 0] / sizes[h, 0]).log(), (sizes[t, 1] / sizes[h, 1]).log(),
+            (area_t / area_h).log(), angle_delta.sin(), angle_delta.cos(),
+            sizes[h].norm(dim=1), sizes[t].norm(dim=1),
+        ), dim=1)
+        motion = torch.stack((
+            delta[:, 0], delta[:, 1], dist, angle_delta.sin(), angle_delta.cos(), area_t / area_h
+        ), dim=1)
+        degree_out = torch.bincount(h, minlength=len(proposal)).float()
+        degree_in = torch.bincount(t, minlength=len(proposal)).float()
+        group = torch.log1p(torch.stack((degree_out[h], degree_in[h], degree_out[t], degree_in[t]), dim=1))
+        label_features = torch.cat((self.vehicle_label_embed(labels[h]), self.vehicle_label_embed(labels[t])), dim=1)
+        return torch.cat((hidden, geometry, motion, group, label_features), dim=1)
+
+    def _vehicle_targets(self, proposals, rel_pair_idxs, hidden: torch.Tensor) -> torch.Tensor:
+        targets = hidden.new_zeros((sum(len(pairs) for pairs in rel_pair_idxs), len(self.vehicle_predicates)))
+        if not self.vehicle_aux_enabled or targets.numel() == 0:
+            return targets
+        offset = 0
+        for proposal, pairs in zip(proposals, rel_pair_idxs):
+            pair_count = len(pairs)
+            if pair_count == 0:
+                continue
+            relation_field = None
+            if proposal.has_field("all_relation_triplets"):
+                relation_field = proposal.get_field("all_relation_triplets")
+            elif proposal.has_field("relation_triplets"):
+                relation_field = proposal.get_field("relation_triplets")
+            if relation_field is None or relation_field.numel() == 0:
+                offset += pair_count
+                continue
+            pair_to_row = {
+                (int(head), int(tail)): row
+                for row, (head, tail) in enumerate(pairs.detach().cpu().tolist())
+            }
+            for head, tail, predicate in relation_field.long().detach().cpu().tolist():
+                col = self.vehicle_predicate_to_col.get(int(predicate))
+                row = pair_to_row.get((int(head), int(tail)))
+                if col is not None and row is not None:
+                    targets[offset + row, col] = 1.0
+            offset += pair_count
+        return targets
 
     def _assign_anchors(self, centers, sizes, angles, labels, anchor_indices):
         """Blockwise learned top-k assignment; temporary memory is O(N * 256)."""
@@ -344,7 +459,7 @@ class TypedHyperRPCM(nn.Module):
         family_log_prob = F.log_softmax(self.family_head(hidden), dim=1)
         logits = hidden.new_full((len(hidden), self.num_rel_classes), -1e4)
         logits[:, 0] = family_log_prob[:, 0]
-        for family, predicates in FAMILY_PREDICATES.items():
+        for family, predicates in self.family_predicates.items():
             if family == 0:
                 continue
             fine = F.log_softmax(self.fine_heads[str(family)](hidden), dim=1)
@@ -396,6 +511,24 @@ class TypedHyperRPCM(nn.Module):
         flat_labels = torch.cat(rel_labels) if self.training and rel_labels else None
         proto_logits, proto_losses = self.proto_head(hidden, flat_labels)
         logits = self.hierarchy_weight * hierarchy_logits + self.proto_logit_weight * proto_logits
+        vehicle_logits = None
+        if self.vehicle_aux_enabled and self.vehicle_aux_head is not None and hidden.numel() > 0:
+            hidden_chunks = hidden.split(num_rels) if num_rels else []
+            vehicle_features = [
+                self._vehicle_pair_features(proposal, pairs, hidden_chunk)
+                for proposal, pairs, hidden_chunk in zip(proposals, rel_pair_idxs, hidden_chunks)
+            ]
+            vehicle_features = torch.cat(vehicle_features, dim=0) if vehicle_features else hidden.new_zeros((0, self.mlp_dim + 56))
+            if vehicle_features.numel() > 0:
+                vehicle_logits = self.vehicle_aux_head(vehicle_features)
+                vehicle_weight = torch.tanh(self.vehicle_logit_scale) * self.vehicle_logit_max_weight
+                logits[:, list(self.vehicle_predicates)] = logits[:, list(self.vehicle_predicates)] + vehicle_weight * vehicle_logits
+                for proposal, vehicle_chunk in zip(proposals, vehicle_logits.split(num_rels)):
+                    proposal.add_field("vehicle_aux_logits", vehicle_chunk.detach())
+                    proposal.add_field(
+                        "vehicle_aux_predicates",
+                        torch.tensor(self.vehicle_predicates, device=vehicle_chunk.device, dtype=torch.long),
+                    )
         logits = list(logits.split(num_rels))
 
         add_losses = dict(proto_losses)
@@ -405,9 +538,24 @@ class TypedHyperRPCM(nn.Module):
             same_prob = torch.cat(same_chunks).clamp(1e-5, 1 - 1e-5)
             reliable_anchor = torch.cat(anchor_valid_chunks)
             anchor_mask = ((family_targets == 2) | (family_targets == 3)) & reliable_anchor
+            if self.anchor_exclude_predicates:
+                excluded = torch.zeros_like(anchor_mask)
+                for predicate in self.anchor_exclude_predicates:
+                    excluded |= flat_labels == int(predicate)
+                anchor_mask &= ~excluded
             if anchor_mask.any():
                 anchor_targets = (family_targets[anchor_mask] == 2).float()
                 add_losses["loss_anchor"] = F.binary_cross_entropy(same_prob[anchor_mask], anchor_targets) * self.anchor_loss_weight
+            if self.vehicle_aux_enabled and vehicle_logits is not None and vehicle_logits.numel() > 0:
+                vehicle_targets = self._vehicle_targets(proposals, rel_pair_idxs, hidden)
+                add_losses["loss_vehicle_aux"] = (
+                    F.binary_cross_entropy_with_logits(
+                        vehicle_logits,
+                        vehicle_targets,
+                        pos_weight=self.vehicle_pos_weight.to(vehicle_logits.device),
+                    )
+                    * self.vehicle_aux_loss_weight
+                )
             probabilities = F.softmax(torch.cat(logits), dim=1)
             logic_terms = [probabilities[:, a] * probabilities[:, b] for a, b in self.logic_pairs]
             add_losses["loss_logic"] = (

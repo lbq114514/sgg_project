@@ -60,6 +60,7 @@ class ROIRelationHead(nn.Module):
         self.loss_evaluator = make_roi_relation_loss_evaluator(cfg)
         self.samp_processor = make_roi_relation_samp_processor(cfg)
         filter_method = str(cfg["MODEL"]["ROI_RELATION_HEAD"].get("TEST_FILTER_METHOD", "NONE")).upper()
+        self.filter_method = filter_method
         self.ppg = (
             PairProposalNetworkFilter(cfg)
             if filter_method == "PPN"
@@ -72,6 +73,7 @@ class ROIRelationHead(nn.Module):
         self.use_gt_box = bool(rel_cfg.get("USE_GT_BOX", False))
         self.use_gt_object_label = bool(rel_cfg.get("USE_GT_OBJECT_LABEL", False))
         self.predictor_name = str(rel_cfg.get("PREDICTOR", ""))
+        self.legacy_filter_flow = bool(rel_cfg.get("RPCM_LEGACY_FILTER_FLOW", False))
         self.use_typed_pair_graph = self.predictor_name.upper() in {
             "TYPED_HYPER_RPCM", "TYPED_RPCM"
         }
@@ -121,6 +123,11 @@ class ROIRelationHead(nn.Module):
                     rel_pair_idxs, rel_labels, _ = self.pair_graph_builder.build(
                         proposals, targets=targets, training=True
                     )
+                    if targets is not None:
+                        for proposal, target in zip(proposals, targets):
+                            for field_name in ("all_relation_triplets", "relation_triplets"):
+                                if target.has_field(field_name) and not proposal.has_field(field_name):
+                                    proposal.add_field(field_name, target.get_field(field_name).to(proposal.bbox.device))
                     rel_binarys = None
                 elif self.use_gt_box:
                     proposals, rel_labels, rel_pair_idxs, rel_binarys = self.samp_processor.gtbox_relsample(proposals, targets)
@@ -134,6 +141,8 @@ class ROIRelationHead(nn.Module):
                 )
                 for proposal, pair_idx in zip(proposals, rel_pair_idxs):
                     proposal.add_field("base_rel_pair_idxs", pair_idx)
+                    proposal.add_field("sema_rel_pair_idxs", pair_idx)
+                    proposal.add_field("final_rel_pair_idxs", pair_idx)
                     proposal.add_field("pruned_rel_pair_idxs", pair_idx)
             else:
                 rel_pair_idxs = self.samp_processor.prepare_test_pairs(self._feature_device(features), proposals)
@@ -141,22 +150,33 @@ class ROIRelationHead(nn.Module):
                     proposal.add_field("base_rel_pair_idxs", pair_idx)
                 filtered_pair_idxs = []
                 for proposal, pair_idx in zip(proposals, rel_pair_idxs):
-                    if proposal.has_field("labels"):
+                    if self.sema_filter.enabled and proposal.has_field("labels"):
                         pair_idx = self.sema_filter.filter_pairs(pair_idx, proposal.get_field("labels").long())
-                    if self.ppg.enabled and self.ppg.filter_method in {"PPG", "PPN"}:
-                        filtered_pair_idx = self.ppg.filter_pairs(proposal, pair_idx)
+                    sema_pair_idx = pair_idx
+                    proposal.add_field("sema_rel_pair_idxs", sema_pair_idx)
+
+                    if (
+                        self.legacy_filter_flow
+                        and self.filter_method == "RANDOM_FILTER"
+                        and sema_pair_idx.size(0) > self.ppg.threshold
+                    ):
+                        rand_idx = torch.randperm(sema_pair_idx.size(0), device=sema_pair_idx.device)
+                        filtered_pair_idx = sema_pair_idx[rand_idx[: self.ppg.topk]]
+                    elif self.ppg.enabled and self.ppg.filter_method in {"PPG", "PPN"}:
+                        filtered_pair_idx = self.ppg.filter_pairs(proposal, sema_pair_idx)
                     else:
-                        filtered_pair_idx = pair_idx
+                        filtered_pair_idx = sema_pair_idx
                     filtered_pair_idxs.append(filtered_pair_idx)
+                    proposal.add_field("final_rel_pair_idxs", filtered_pair_idx)
                     proposal.add_field("pruned_rel_pair_idxs", filtered_pair_idx)
                 rel_pair_idxs = filtered_pair_idxs
 
         if self.use_gt_box and self.use_gt_object_label and (
-            self.predictor_name == "RPCM" or self.use_typed_pair_graph
+            self.predictor_name in {"RPCM", "RPCM_LEGACY", "LEGACY_RPCM"} or self.use_typed_pair_graph
         ):
             for proposal in proposals:
-                labels = proposal.get_field("labels").long().clamp(min=0, max=self.num_obj_classes)
-                predict_logits = _to_onehot_logits(labels, num_classes=self.num_obj_classes + 1)
+                labels = proposal.get_field("labels").long().clamp(min=0, max=self.num_obj_classes - 1)
+                predict_logits = _to_onehot_logits(labels, num_classes=self.num_obj_classes)
                 proposal.add_field("predict_logits", predict_logits.to(proposal.bbox.device))
                 proposal.add_field("pred_scores", torch.ones(len(labels), device=proposal.bbox.device))
                 proposal.add_field("pred_labels", labels.to(proposal.bbox.device))

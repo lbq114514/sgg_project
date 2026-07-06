@@ -6,6 +6,7 @@ from sgg.modeling.roi_heads.typed_hyper_rpcm import (
     SparseHypergraphLayer,
     SparseTypedMessageLayer,
     TypedHyperRPCM,
+    build_family_predicates,
     validate_family_mapping,
 )
 
@@ -18,6 +19,15 @@ def test_family_mapping_is_complete_and_unique():
     assert set(mapping[1:].tolist()) == set(range(1, 7))
     assert mapping[38].item() == 3
     assert mapping[39].item() == 2
+
+
+def test_lane_aware_family_mapping_moves_lane_out_of_anchor_families():
+    families = build_family_predicates({"TYPED_LANE_AS_MOTION": True, "TYPED_LANE_PREDICATES": [38, 39]})
+    mapping = validate_family_mapping(59, families)
+    assert mapping[38].item() == 5
+    assert mapping[39].item() == 5
+    assert 38 not in families[3]
+    assert 39 not in families[2]
 
 
 def test_hierarchy_logits_fill_global_predicate_space():
@@ -54,6 +64,58 @@ def test_degree_cap_partition_and_gt_schedule():
     assert builder._gt_injection_ratio(5) == 1.0
     assert builder._gt_injection_ratio(10) == 0.0
     assert 0 < builder._gt_injection_ratio(7) < 1
+
+
+def test_star_relation_fields_keep_all_raw_relations_for_auxiliary_targets():
+    from sgg.data.datasets.star import STARDataset
+
+    dataset = STARDataset.__new__(STARDataset)
+    dataset.filter_duplicate_relations = True
+    pair_labels, rel_triplets, all_rel_triplets = dataset._build_relation_fields(
+        torch.tensor([
+            [0, 1, 38],
+            [0, 1, 11],
+            [1, 0, 6],
+        ]),
+        num_objects=2,
+    )
+    assert pair_labels.shape == (2, 2)
+    assert rel_triplets.shape == (2, 3)
+    assert all_rel_triplets.tolist() == [[0, 1, 38], [0, 1, 11], [1, 0, 6]]
+
+
+def test_vehicle_aux_targets_are_multihot_for_same_pair():
+    class DummyProposal:
+        def __init__(self):
+            self.fields = {
+                "all_relation_triplets": torch.tensor([
+                    [0, 1, 38],
+                    [0, 1, 11],
+                    [1, 0, 6],
+                ])
+            }
+
+        def has_field(self, name):
+            return name in self.fields
+
+        def get_field(self, name):
+            return self.fields[name]
+
+    module = TypedHyperRPCM.__new__(TypedHyperRPCM)
+    torch.nn.Module.__init__(module)
+    module.vehicle_aux_enabled = True
+    module.vehicle_predicates = (6, 11, 31, 37, 38, 39, 41)
+    module.vehicle_predicate_to_col = {predicate: idx for idx, predicate in enumerate(module.vehicle_predicates)}
+    targets = module._vehicle_targets(
+        [DummyProposal()],
+        [torch.tensor([[0, 1], [1, 0], [0, 0]])],
+        torch.zeros((3, 4)),
+    )
+    assert targets.shape == (3, 7)
+    assert targets[0, module.vehicle_predicate_to_col[38]].item() == 1.0
+    assert targets[0, module.vehicle_predicate_to_col[11]].item() == 1.0
+    assert targets[1, module.vehicle_predicate_to_col[6]].item() == 1.0
+    assert targets[2].sum().item() == 0.0
 
 
 def test_sparse_layers_forward_backward_without_square_maps():

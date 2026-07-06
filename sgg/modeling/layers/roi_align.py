@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sgg.modeling.core.obb_ops import convert_obb_angle_unit, get_boxlist_angle_unit
+
 try:
     from mmcv.ops import RoIAlignRotated
 except Exception:
@@ -34,6 +36,12 @@ def _convert_boxes_to_roi_format(
     for i, boxes_per_image in enumerate(boxes):
         if hasattr(boxes_per_image, "bbox"):
             boxes_tensor = boxes_per_image.bbox
+            if mode == "obb":
+                boxes_tensor = convert_obb_angle_unit(
+                    boxes_tensor,
+                    get_boxlist_angle_unit(boxes_per_image),
+                    "radian",
+                )
         else:
             boxes_tensor = boxes_per_image
 

@@ -2,15 +2,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sgg.modeling.core.obb_ops import convert_obb_angle_unit, obb2xyxy
+
 try:
     from mmcv.ops import nms_rotated as mmcv_nms_rotated
 except Exception:
     mmcv_nms_rotated = None
-
-try:
-    from mmrotate.core import obb2xyxy
-except Exception:
-    obb2xyxy = None
 
 
 def _box_iou_hbb(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -67,6 +64,7 @@ def nms(
     iou_threshold: float,
     mode: str = "hbb",
     obb_fallback_to_hbb: bool = False,
+    angle_unit: str = "degree",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Unified NMS wrapper for HBB / OBB.
@@ -120,11 +118,13 @@ def nms(
                     "Install mmcv-full or call with obb_fallback_to_hbb=True "
                     "to use axis-aligned fallback NMS."
                 )
-            hbb = _obb_to_hbb(boxes)
+            hbb = _obb_to_hbb(boxes, angle_unit=angle_unit)
             keep = _nms_hbb(hbb, scores, iou_threshold)
             dets = torch.cat([boxes[keep], scores[keep, None]], dim=1)
             return dets, keep
-        dets, keep = mmcv_nms_rotated(boxes, scores, iou_threshold)
+        boxes_rad = convert_obb_angle_unit(boxes, angle_unit, "radian")
+        _, keep = mmcv_nms_rotated(boxes_rad, scores, iou_threshold)
+        dets = torch.cat([boxes[keep], scores[keep, None]], dim=1)
         return dets, keep
 
     raise ValueError(f"Unsupported mode: {mode}")
@@ -137,6 +137,7 @@ def batched_nms(
     iou_threshold: float,
     mode: str = "hbb",
     obb_fallback_to_hbb: bool = False,
+    angle_unit: str = "degree",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Batched NMS wrapper for HBB / OBB.
@@ -189,7 +190,7 @@ def batched_nms(
                     "Install mmcv-full or call with obb_fallback_to_hbb=True "
                     "to use axis-aligned fallback batched NMS."
                 )
-            hbb = _obb_to_hbb(boxes)
+            hbb = _obb_to_hbb(boxes, angle_unit=angle_unit)
             keep = _batched_nms_hbb(hbb, scores, idxs, iou_threshold)
             dets = torch.cat([boxes[keep], scores[keep, None]], dim=1)
             return dets, keep
@@ -202,7 +203,8 @@ def batched_nms(
             if inds.numel() == 0:
                 continue
 
-            dets_i, keep_i = mmcv_nms_rotated(boxes[inds], scores[inds], iou_threshold)
+            boxes_rad = convert_obb_angle_unit(boxes[inds], angle_unit, "radian")
+            _, keep_i = mmcv_nms_rotated(boxes_rad, scores[inds], iou_threshold)
             original_keep = inds[keep_i]
             all_keep.append(original_keep)
 
@@ -229,6 +231,7 @@ def multiclass_nms(
     scores_include_bg: bool = False,
     bg_index: int = -1,
     obb_fallback_to_hbb: bool = False,
+    angle_unit: str = "degree",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Multi-class NMS for HBB / OBB.
@@ -328,6 +331,7 @@ def multiclass_nms(
         iou_threshold=iou_threshold,
         mode=mode,
         obb_fallback_to_hbb=obb_fallback_to_hbb,
+        angle_unit=angle_unit,
     )
 
     labels = labels[keep]
@@ -339,16 +343,16 @@ def multiclass_nms(
     return dets, labels
 
 
-def _obb_to_hbb(boxes: torch.Tensor) -> torch.Tensor:
+def _obb_to_hbb(boxes: torch.Tensor, angle_unit: str = "degree") -> torch.Tensor:
     """Convert ``xywha`` boxes to axis-aligned ``xyxy`` envelopes."""
     if obb2xyxy is not None:
-        return obb2xyxy(boxes, version="oc")
+        return obb2xyxy(boxes, version="oc", angle_unit=angle_unit)
 
     ctr_x = boxes[:, 0]
     ctr_y = boxes[:, 1]
     widths = boxes[:, 2]
     heights = boxes[:, 3]
-    angles = boxes[:, 4]
+    angles = convert_obb_angle_unit(boxes, angle_unit, "radian")[:, 4]
 
     cos = torch.abs(torch.cos(angles))
     sin = torch.abs(torch.sin(angles))

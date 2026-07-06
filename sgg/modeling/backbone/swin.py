@@ -196,21 +196,24 @@ class PatchMerging(nn.Module):
         B, L, C = x.shape
         H, W = hw_shape
 
-        x = x.reshape(B, H, W, C)
+        # Match MMDetection/MMRotate PatchMerging exactly.  Their
+        # implementation uses nn.Unfold on BCHW tensors, so the flattened
+        # 2x2 patch order is channel-major:
+        #   [c0_tl, c0_tr, c0_bl, c0_br, c1_tl, ...]
+        # The previous manual concat used position-major ordering
+        #   [tl_all_channels, bl_all_channels, tr_all_channels, br_all_channels]
+        # which is incompatible with original Swin checkpoint weights.
+        x = x.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
-        if H % 2 == 1 or W % 2 == 1:
-            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+        pad_h = H % 2
+        pad_w = W % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+            H = H + pad_h
+            W = W + pad_w
 
-        x0 = x[:, 0::2, 0::2, :]
-        x1 = x[:, 1::2, 0::2, :]
-        x2 = x[:, 0::2, 1::2, :]
-        x3 = x[:, 1::2, 1::2, :]
-
-        x = torch.cat([x0, x1, x2, x3], dim=-1)
-
-        H2, W2 = x.shape[1], x.shape[2]
-
-        x = x.reshape(B, H2 * W2, 4 * C)
+        x = F.unfold(x, kernel_size=2, stride=2).transpose(1, 2)
+        H2, W2 = H // 2, W // 2
         x = self.norm(x)
         x = self.reduction(x)
 

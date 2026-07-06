@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import re
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
@@ -8,6 +7,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 from torch import nn
 
+from sgg.modeling.core.obb_ops import angle_to_radians, get_boxlist_angle_unit
 from sgg.structures.boxes import BoxList
 
 
@@ -89,7 +89,7 @@ class PairProposalNetwork(nn.Module):
         if proposal.mode == "xywha":
             center = boxes[:, :2]
             size = boxes[:, 2:4].clamp(min=1e-4)
-            angle = boxes[:, 4] * (math.pi / 180.0)
+            angle = angle_to_radians(boxes[:, 4], get_boxlist_angle_unit(proposal))
         else:
             xyxy = proposal.convert("xyxy").bbox.float()
             center = 0.5 * (xyxy[:, :2] + xyxy[:, 2:])

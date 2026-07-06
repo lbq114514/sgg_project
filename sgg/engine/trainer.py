@@ -16,6 +16,7 @@ from pathlib import Path
 
 from sgg.data.build import build_dataloaders
 from sgg.evaluation import evaluate_sgg
+from sgg.modeling.roi_heads.typed_hyper_rpcm import build_family_predicates
 from sgg.structures.boxes import BoxList
 from sgg.structures.boxlist_ops import boxlist_iou
 
@@ -164,6 +165,51 @@ def _build_eval_debug_lines(metrics: Dict, predicate_names=None, top_predicates:
                 f"gt_pair={int(item.get('gt_pair_count', 0))}, "
                 f"pred_pair={int(item.get('pred_pair_count', 0))}, "
                 f"triplet_R={float(item.get('triplet_recall', 0.0)):.3f}"
+            )
+    predicate_candidates = debug.get("predicate_candidate_coverage", [])
+    if predicate_candidates:
+        lines.append("Predicate Candidate Coverage:")
+        for item in predicate_candidates[: max(int(top_predicates), 0)]:
+            predicate = int(item.get("predicate", 0))
+            lines.append(
+                "  "
+                f"{_predicate_name(predicate_names, predicate)} "
+                f"count={int(item.get('count', 0))}, "
+                f"recall={float(item.get('recall', 0.0)):.4f}, "
+                f"semantic={float(item.get('semantic', 0.0)):.4f}, "
+                f"ppn={float(item.get('ppn', 0.0)):.4f}, "
+                f"degree={float(item.get('degree_cap', 0.0)):.4f}, "
+                f"final={float(item.get('final', 0.0)):.4f}"
+            )
+    predicate_confusion = debug.get("predicate_pair_cls_confusion", [])
+    if predicate_confusion:
+        lines.append("GT Pair Top-Predicate Confusion:")
+        for item in predicate_confusion[: max(int(top_predicates), 0)]:
+            predicate = int(item.get("predicate", 0))
+            predictions = item.get("predictions", [])
+            pieces = []
+            for pred_item in predictions:
+                pred_id = int(pred_item.get("predicate", 0))
+                pieces.append(
+                    f"{_predicate_name(predicate_names, pred_id)}:{int(pred_item.get('count', 0))}"
+                )
+            lines.append(
+                "  "
+                f"{_predicate_name(predicate_names, predicate)} "
+                f"covered={int(item.get('covered', 0))} -> "
+                + ", ".join(pieces)
+            )
+    vehicle_aux = debug.get("vehicle_aux", [])
+    if vehicle_aux:
+        lines.append("Vehicle Aux:")
+        for item in vehicle_aux[: max(int(top_predicates), 0)]:
+            predicate = int(item.get("predicate", 0))
+            lines.append(
+                "  "
+                f"{_predicate_name(predicate_names, predicate)} "
+                f"pos={int(item.get('pos', 0))}, "
+                f"aux_recall@0={float(item.get('aux_recall_at_0', 0.0)):.4f}, "
+                f"avg_logit={float(item.get('avg_logit', 0.0)):.4f}"
             )
     return lines
 
@@ -696,9 +742,13 @@ class Trainer:
         model_cfg = self.cfg.get("MODEL", {})
         freeze_map = {
             "backbone": bool(model_cfg.get("FREEZE_BACKBONE", False)),
+            "backbone_d2": bool(model_cfg.get("FREEZE_BACKBONE", False)),
             "neck": bool(model_cfg.get("FREEZE_NECK", False)),
+            "neck_d2": bool(model_cfg.get("FREEZE_NECK", False)),
             "rpn_head": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
+            "rpn_head_d2": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
             "roi_head": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
+            "roi_head_d2": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
         }
         for module_name, should_freeze in freeze_map.items():
             if not should_freeze or not hasattr(self.model, module_name):
@@ -715,9 +765,13 @@ class Trainer:
         model_cfg = self.cfg.get("MODEL", {})
         for module_name, should_freeze in {
             "backbone": bool(model_cfg.get("FREEZE_BACKBONE", False)),
+            "backbone_d2": bool(model_cfg.get("FREEZE_BACKBONE", False)),
             "neck": bool(model_cfg.get("FREEZE_NECK", False)),
+            "neck_d2": bool(model_cfg.get("FREEZE_NECK", False)),
             "rpn_head": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
+            "rpn_head_d2": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
             "roi_head": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
+            "roi_head_d2": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
         }.items():
             if should_freeze and hasattr(self.model, module_name):
                 module = getattr(self.model, module_name)
@@ -735,7 +789,10 @@ class Trainer:
         momentum = float(solver_cfg.get("MOMENTUM", 0.9))
         betas = tuple(float(v) for v in solver_cfg.get("BETAS", (0.9, 0.999)))
         eps = float(solver_cfg.get("EPS", 1e-8))
-        rl_factor = float(self.cfg.get("DATALOADER", {}).get("TRAIN_BATCH_SIZE", self.cfg.get("DATALOADER", {}).get("BATCH_SIZE", 1)))
+        if bool(solver_cfg.get("LR_SCALE_BY_BATCH", True)):
+            rl_factor = float(self.cfg.get("DATALOADER", {}).get("TRAIN_BATCH_SIZE", self.cfg.get("DATALOADER", {}).get("BATCH_SIZE", 1)))
+        else:
+            rl_factor = 1.0
 
         predictor_name = str(self.cfg.get("MODEL", {}).get("ROI_RELATION_HEAD", {}).get("PREDICTOR", ""))
         slow_heads = ["roi_heads.relation.box_feature_extractor", "roi_heads.relation.union_feature_extractor.feature_extractor"] if predictor_name == "IMPPredictor" else []
@@ -862,7 +919,7 @@ class Trainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        state_dict = self._checkpoint_state_dict(ckpt)
         incompatible = self.model.load_state_dict(state_dict, strict=False)
         filter_prefixes = (
             "roi_heads.relation.ppg.",
@@ -897,12 +954,55 @@ class Trainer:
             self.global_step = int(ckpt["global_step"])
         return ckpt
 
+    @staticmethod
+    def _checkpoint_state_dict(ckpt):
+        if isinstance(ckpt, dict):
+            for key in ("model", "state_dict", "module"):
+                value = ckpt.get(key)
+                if isinstance(value, dict):
+                    return value
+        return ckpt
+
     def load_rpcm_predictor_weights(self, path: str):
         """Initialize the compatible TypedHyperRPCM blocks from an RPCM checkpoint."""
         ckpt = torch.load(path, map_location="cpu")
-        source = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        source = self._checkpoint_state_dict(ckpt)
         target = self.model.state_dict()
         predictor_prefix = "roi_heads.relation.predictor."
+        predictor_name = str(
+            self.cfg.get("MODEL", {}).get("ROI_RELATION_HEAD", {}).get("PREDICTOR", "")
+        )
+        if predictor_name == "RPCM_LEGACY":
+            loaded, shape_mismatch, missing = [], [], []
+            update = {}
+            for key, target_value in target.items():
+                if not key.startswith(predictor_prefix):
+                    continue
+                if key not in source:
+                    missing.append(key)
+                elif source[key].shape != target_value.shape:
+                    shape_mismatch.append((key, tuple(source[key].shape), tuple(target_value.shape)))
+                else:
+                    update[key] = source[key]
+                    loaded.append(key)
+            unexpected = [
+                key for key in source
+                if key.startswith(predictor_prefix) and key not in target
+            ]
+            if missing or shape_mismatch or unexpected:
+                raise RuntimeError(
+                    "RPCM_LEGACY predictor checkpoint is incompatible: "
+                    f"missing={missing}, shape_mismatch={shape_mismatch}, unexpected={unexpected}"
+                )
+            target.update(update)
+            self.model.load_state_dict(target, strict=True)
+            print(
+                "RPCM_LEGACY predictor initialization:",
+                {"checkpoint": path, "loaded_predictor_keys": len(loaded)},
+                flush=True,
+            )
+            return {"checkpoint": path, "loaded": loaded}
+
         shared_prefixes = (
             "pairwise_feature_extractor.",
             "down_samp.",
@@ -971,17 +1071,75 @@ class Trainer:
                 print(f"  {name}: {report[name]}", flush=True)
         return report
 
+    def load_typed_stage_weights(self, path: str):
+        """Initialize from a TypedHyperRPCM checkpoint, allowing newly added aux heads."""
+        ckpt = torch.load(path, map_location="cpu")
+        source = self._checkpoint_state_dict(ckpt)
+        target = self.model.state_dict()
+        allowed_missing_prefixes = (
+            "roi_heads.relation.ppg.",
+            "roi_heads.relation.ppn.",
+            "roi_heads.relation.predictor.vehicle_aux_head.",
+            "roi_heads.relation.predictor.vehicle_label_embed.",
+        )
+        allowed_missing_keys = {
+            "roi_heads.relation.predictor.vehicle_logit_scale",
+            "roi_heads.relation.predictor.vehicle_pos_weight",
+        }
+        ignored_unexpected_prefixes = (
+            "roi_heads.relation.ppg.",
+            "roi_heads.relation.ppn.",
+        )
+        update, missing, shape_mismatch = {}, [], []
+        for key, target_value in target.items():
+            if key not in source:
+                if key in allowed_missing_keys or key.startswith(allowed_missing_prefixes):
+                    continue
+                missing.append(key)
+            elif source[key].shape != target_value.shape:
+                shape_mismatch.append((key, tuple(source[key].shape), tuple(target_value.shape)))
+            else:
+                update[key] = source[key]
+        unexpected = [
+            key for key in source
+            if key not in target and not key.startswith(ignored_unexpected_prefixes)
+        ]
+        if missing or shape_mismatch or unexpected:
+            raise RuntimeError(
+                "Typed checkpoint is incompatible: "
+                f"missing={missing}, shape_mismatch={shape_mismatch}, unexpected={unexpected}"
+            )
+        target.update(update)
+        self.model.load_state_dict(target, strict=True)
+        print(
+            "TypedHyperRPCM initialization:",
+            {
+                "checkpoint": path,
+                "loaded": len(update),
+                "new_aux_keys": len(target) - len(update),
+            },
+            flush=True,
+        )
+        return {"checkpoint": path, "loaded": list(update.keys())}
+
     def _move_targets(self, targets):
         return [t.to(self.device) for t in targets]
 
     def train(self, start_epoch: int = 0):
+        val_split = str(self.cfg.get("SOLVER", {}).get("VAL_SPLIT", "val")).lower()
         loaders = self.dataloaders or build_dataloaders(
             self.cfg,
-            splits=("train", "val"),
-            shuffle_map={"train": True, "val": False},
+            splits=("train", val_split),
+            shuffle_map={"train": True, val_split: False},
         )
         train_loader = loaders["train"]
-        val_loader = loaders.get("val")
+        val_loader = loaders.get(val_split)
+        if val_loader is None and val_split != "val":
+            raise KeyError(
+                f"SOLVER.VAL_SPLIT={val_split!r} was requested, but available loaders are {sorted(loaders.keys())}"
+            )
+        if val_loader is not None:
+            print(f"Validation split: {val_split}", flush=True)
         epochs = self.cfg["SOLVER"]["MAX_EPOCHS"]
         accumulation_steps = max(
             1, int(self.cfg.get("SOLVER", {}).get("GRADIENT_ACCUMULATION_STEPS", 1))
@@ -1161,13 +1319,12 @@ class Trainer:
             mean_recall_value = res.mean_recall.get(k, 0.0)
             denom = recall_value + mean_recall_value
             harmonic_recall[k] = 0.0 if denom <= 0 else float(2.0 * recall_value * mean_recall_value / denom)
-        family_predicates = (
-            (3, 4, 16, 17, 18, 19, 26, 47, 49, 54),
-            (8, 21, 28, 34, 39, 40, 51),
-            (10, 22, 25, 32, 35, 38, 50),
-            (1, 2, 5, 6, 7, 9, 12, 13, 14, 23, 24, 27, 31, 33, 36),
-            (11, 15, 20, 29, 30, 37, 41, 46, 48),
-            (42, 43, 44, 45, 52, 53, 55, 56, 57, 58),
+        family_predicates = tuple(
+            predicates
+            for family, predicates in sorted(
+                build_family_predicates(self.cfg["MODEL"]["ROI_RELATION_HEAD"]).items()
+            )
+            if family != 0
         )
         family_macro_recall = {}
         for k, per_predicate in res.per_predicate_recall.items():
@@ -1184,6 +1341,7 @@ class Trainer:
             "family_macro_recall": family_macro_recall,
             "candidate-stage-coverage": res.candidate_stage_coverage,
             "predicate-candidate-stage-coverage": res.predicate_candidate_stage_coverage,
+            "vehicle-aux": res.vehicle_aux_stats,
             "A": res.pair_accuracy if self.cfg["MODEL"]["TASK"] != "sgdet" else {},
             "images": res.num_images,
             "valid_images": res.valid_images,
@@ -1209,6 +1367,33 @@ class Trainer:
                         "recall": float(res.per_predicate_recall.get(best_k, {}).get(predicate, 0.0)),
                     }
                 )
+            coverage_rows = []
+            focus_predicates = {
+                int(v)
+                for v in debug_cfg.get("CANDIDATE_PREDICATES", [])
+                if int(v) > 0
+            }
+            for row in predicate_rows:
+                predicate = int(row["predicate"])
+                if focus_predicates and predicate not in focus_predicates:
+                    continue
+                coverage_rows.append(
+                    {
+                        **row,
+                        "semantic": float(
+                            res.predicate_candidate_stage_coverage.get("semantic", {}).get(predicate, 0.0)
+                        ),
+                        "ppn": float(
+                            res.predicate_candidate_stage_coverage.get("ppn", {}).get(predicate, 0.0)
+                        ),
+                        "degree_cap": float(
+                            res.predicate_candidate_stage_coverage.get("degree_cap", {}).get(predicate, 0.0)
+                        ),
+                        "final": float(
+                            res.predicate_candidate_stage_coverage.get("final", {}).get(predicate, 0.0)
+                        ),
+                    }
+                )
             predicate_rows.sort(
                 key=lambda item: (
                     item["recall"],
@@ -1216,6 +1401,39 @@ class Trainer:
                     item["predicate"],
                 )
             )
+            coverage_rows.sort(
+                key=lambda item: (
+                    item["final"],
+                    item["recall"],
+                    -item["count"],
+                    item["predicate"],
+                )
+            )
+            confusion_rows = []
+            for predicate, predicted_counts in sorted(res.predicate_pair_cls_confusion.items()):
+                predicate = int(predicate)
+                if focus_predicates and predicate not in focus_predicates:
+                    continue
+                top_predictions = sorted(
+                    (
+                        {"predicate": int(predicted), "count": int(count)}
+                        for predicted, count in predicted_counts.items()
+                    ),
+                    key=lambda item: (-item["count"], item["predicate"]),
+                )[: max(int(debug_cfg.get("CONFUSION_TOPK", 8)), 1)]
+                confusion_rows.append(
+                    {
+                        "predicate": predicate,
+                        "covered": int(sum(int(count) for count in predicted_counts.values())),
+                        "predictions": top_predictions,
+                    }
+                )
+            vehicle_aux_rows = []
+            for predicate, stats in sorted(res.vehicle_aux_stats.items()):
+                predicate = int(predicate)
+                if focus_predicates and predicate not in focus_predicates:
+                    continue
+                vehicle_aux_rows.append({"predicate": predicate, **stats})
             image_rows = list(res.debug_rows)
             image_rows.sort(
                 key=lambda item: (
@@ -1231,6 +1449,9 @@ class Trainer:
                     "mean_recall": float(res.mean_recall.get(best_k, 0.0)),
                 },
                 "predicate_details": predicate_rows,
+                "predicate_candidate_coverage": coverage_rows,
+                "predicate_pair_cls_confusion": confusion_rows,
+                "vehicle_aux": vehicle_aux_rows,
                 "hardest_images": image_rows[: max(int(debug_cfg.get("TOP_IMAGES", 10)), 0)],
             }
             for line in _build_eval_debug_lines(

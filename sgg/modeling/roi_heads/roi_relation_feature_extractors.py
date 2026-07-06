@@ -8,41 +8,54 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sgg.modeling.core.obb_ops import obb2poly, norm_angle
+from sgg.modeling.core.obb_ops import (
+    angle_from_radians,
+    angle_to_radians,
+    get_boxlist_angle_unit,
+    norm_angle,
+    obb2poly,
+    set_boxlist_angle_unit,
+)
 from sgg.modeling.roi_extractors import MultiScaleROIExtractor, RotatedROIExtractor
 from sgg.structures.boxes import BoxList
 
-def _average_obb_angle_deg(angle1: torch.Tensor, angle2: torch.Tensor) -> torch.Tensor:
-    rad1 = torch.deg2rad(angle1)
-    rad2 = torch.deg2rad(angle2)
+def _average_obb_angle(angle1: torch.Tensor, angle2: torch.Tensor, angle_unit: str) -> torch.Tensor:
+    rad1 = angle_to_radians(angle1, angle_unit)
+    rad2 = angle_to_radians(angle2, angle_unit)
     sin2 = torch.sin(2.0 * rad1) + torch.sin(2.0 * rad2)
     cos2 = torch.cos(2.0 * rad1) + torch.cos(2.0 * rad2)
     avg = 0.5 * torch.atan2(sin2, cos2)
-    return torch.rad2deg(avg)
+    return angle_from_radians(avg, angle_unit)
 
 
-def _enclosing_union_obb(subject_boxes: torch.Tensor, object_boxes: torch.Tensor, angle_version: str) -> torch.Tensor:
+def _enclosing_union_obb(
+    subject_boxes: torch.Tensor,
+    object_boxes: torch.Tensor,
+    angle_version: str,
+    angle_unit: str,
+) -> torch.Tensor:
     if subject_boxes.numel() == 0:
         return subject_boxes.new_zeros((0, 5))
 
-    subj_poly = obb2poly(subject_boxes, version=angle_version).view(-1, 4, 2)
-    obj_poly = obb2poly(object_boxes, version=angle_version).view(-1, 4, 2)
+    subj_poly = obb2poly(subject_boxes, version=angle_version, angle_unit=angle_unit).view(-1, 4, 2)
+    obj_poly = obb2poly(object_boxes, version=angle_version, angle_unit=angle_unit).view(-1, 4, 2)
     points = torch.cat([subj_poly, obj_poly], dim=1)
 
     angle_candidates = torch.stack(
         [
             subject_boxes[:, 4],
             object_boxes[:, 4],
-            _average_obb_angle_deg(subject_boxes[:, 4], object_boxes[:, 4]),
+            _average_obb_angle(subject_boxes[:, 4], object_boxes[:, 4], angle_unit),
         ],
         dim=1,
     )
+    right_angle = torch.as_tensor(np.pi / 2 if angle_unit == "radian" else 90.0, device=subject_boxes.device, dtype=subject_boxes.dtype)
 
     best_area = None
     best_boxes = None
     for cand_idx in range(angle_candidates.size(1)):
         angle = angle_candidates[:, cand_idx]
-        rad = torch.deg2rad(angle)
+        rad = angle_to_radians(angle, angle_unit)
         cos = torch.cos(rad)
         sin = torch.sin(rad)
         rot = torch.stack(
@@ -73,8 +86,8 @@ def _enclosing_union_obb(subject_boxes: torch.Tensor, object_boxes: torch.Tensor
             swapped = boxes[swap, 2].clone()
             boxes[swap, 2] = boxes[swap, 3]
             boxes[swap, 3] = swapped
-            boxes[swap, 4] = boxes[swap, 4] + 90.0
-        boxes[:, 4] = norm_angle(boxes[:, 4], angle_version)
+            boxes[swap, 4] = boxes[swap, 4] + right_angle
+        boxes[:, 4] = norm_angle(boxes[:, 4], angle_version, angle_unit=angle_unit)
 
         area = boxes[:, 2] * boxes[:, 3]
         if best_area is None:
@@ -86,6 +99,77 @@ def _enclosing_union_obb(subject_boxes: torch.Tensor, object_boxes: torch.Tensor
             best_boxes = torch.where(keep[:, None], boxes, best_boxes)
 
     return best_boxes
+
+
+def _legacy_obb2poly_le90_rad(rboxes: torch.Tensor) -> torch.Tensor:
+    """Original RPCM ``obb2poly_le90`` implementation.
+
+    The legacy code assumes angle values are already radians and applies
+    ``sin/cos`` directly.  Keep this helper local to the legacy path so newer
+    callers continue using explicit angle-unit conversion.
+    """
+    if rboxes.numel() == 0:
+        return rboxes.new_zeros((0, 8))
+    x_ctr, y_ctr, width, height, angle = rboxes.t()
+    tl_x, tl_y = -width * 0.5, -height * 0.5
+    br_x, br_y = width * 0.5, height * 0.5
+    rects = torch.stack(
+        [tl_x, br_x, br_x, tl_x, tl_y, tl_y, br_y, br_y],
+        dim=0,
+    ).reshape(2, 4, rboxes.size(0)).permute(2, 0, 1)
+    sin_a, cos_a = torch.sin(angle), torch.cos(angle)
+    rot = torch.stack([cos_a, -sin_a, sin_a, cos_a], dim=0).reshape(
+        2, 2, rboxes.size(0)
+    ).permute(2, 0, 1)
+    polys = rot.matmul(rects).permute(2, 1, 0).reshape(-1, rboxes.size(0)).transpose(1, 0)
+    polys[:, ::2] += x_ctr.unsqueeze(1)
+    polys[:, 1::2] += y_ctr.unsqueeze(1)
+    return polys.contiguous()
+
+
+def _legacy_poly2obb_le90_8_batch(polys: torch.Tensor) -> torch.Tensor:
+    """Original RPCM ``poly2obb_np_le90_8_batch_vectorized`` behavior."""
+    if polys.numel() == 0:
+        return polys.new_zeros((0, 5))
+    polys_np = polys.detach().cpu().reshape((-1, 8, 2)).to(torch.float32).numpy()
+    rbboxes = np.array([cv2.minAreaRect(poly) for poly in polys_np], dtype=object)
+    x = np.array([item[0][0] for item in rbboxes])
+    y = np.array([item[0][1] for item in rbboxes])
+    w = np.array([item[1][0] for item in rbboxes])
+    h = np.array([item[1][1] for item in rbboxes])
+    angle = np.array([item[2] for item in rbboxes]) / 180.0 * np.pi
+
+    swap = w < h
+    w[swap], h[swap] = h[swap], w[swap]
+    angle[swap] += np.pi / 2.0
+
+    too_large = angle >= np.pi / 2.0
+    angle[too_large] -= np.pi
+    too_small = angle < -np.pi / 2.0
+    angle[too_small] += np.pi
+
+    boxes = np.column_stack((x, y, w, h, angle))
+    return torch.as_tensor(boxes, dtype=polys.dtype, device=polys.device)
+
+
+def _legacy_union_obb(
+    subject_boxes: torch.Tensor,
+    object_boxes: torch.Tensor,
+    angle_unit: str,
+) -> torch.Tensor:
+    """Match original RPCM ``boxlist_union(..., flag2=True)`` for OBBs."""
+    if subject_boxes.numel() == 0:
+        return subject_boxes.new_zeros((0, 5))
+    subj_rad = subject_boxes.clone()
+    obj_rad = object_boxes.clone()
+    subj_rad[:, 4] = angle_to_radians(subj_rad[:, 4], angle_unit)
+    obj_rad[:, 4] = angle_to_radians(obj_rad[:, 4], angle_unit)
+    subj_poly = _legacy_obb2poly_le90_rad(subj_rad)
+    obj_poly = _legacy_obb2poly_le90_rad(obj_rad)
+    union_rad = _legacy_poly2obb_le90_8_batch(torch.cat((subj_poly, obj_poly), dim=1))
+    union_boxes = union_rad.to(dtype=subject_boxes.dtype, device=subject_boxes.device)
+    union_boxes[:, 4] = angle_from_radians(union_boxes[:, 4], angle_unit)
+    return union_boxes
 
 
 class RelationBoxFeatureExtractor(nn.Module):
@@ -156,6 +240,7 @@ class RelationUnionFeatureExtractor(nn.Module):
                 self.pooler = MultiScaleROIExtractor.from_config(roi_cfg)
         self.box_mode = box_mode
         self.separate_spatial = bool(rel_cfg.get("CAUSAL", {}).get("SEPARATE_SPATIAL", False))
+        self.use_rpcm_legacy_union = bool(rel_cfg.get("RPCM_LEGACY_UNION_BOX", False))
         hidden_dim = int(cfg["MODEL"]["ROI_RELATION_HEAD"].get("CONTEXT_POOLING_DIM", cfg["MODEL"]["RELATION_HEAD"]["EDGE_DIM"]))
         detector_feat_dim = int(cfg["MODEL"].get("ROI_BOX_HEAD", {}).get("MLP_HEAD_DIM", hidden_dim))
         self.pool_size = pool_size
@@ -191,7 +276,10 @@ class RelationUnionFeatureExtractor(nn.Module):
     def _resize_proposal_for_rect(self, proposal: BoxList) -> BoxList:
         if len(proposal) == 0:
             box_dim = proposal.bbox.size(1)
-            return BoxList(proposal.bbox.new_zeros((0, box_dim)), (self.rect_size, self.rect_size), proposal.mode)
+            resized = BoxList(proposal.bbox.new_zeros((0, box_dim)), (self.rect_size, self.rect_size), proposal.mode)
+            if proposal.mode == "xywha":
+                set_boxlist_angle_unit(resized, get_boxlist_angle_unit(proposal))
+            return resized
         width, height = proposal.size
         ratio_width = float(self.rect_size) / float(width)
         ratio_height = float(self.rect_size) / float(height)
@@ -201,7 +289,9 @@ class RelationUnionFeatureExtractor(nn.Module):
             scaled_box[:, 1] *= ratio_height
             scaled_box[:, 2] *= np.sqrt(ratio_width * ratio_height)
             scaled_box[:, 3] *= np.sqrt(ratio_width * ratio_height)
-            return BoxList(scaled_box, (self.rect_size, self.rect_size), "xywha")
+            resized = BoxList(scaled_box, (self.rect_size, self.rect_size), "xywha")
+            set_boxlist_angle_unit(resized, get_boxlist_angle_unit(proposal))
+            return resized
         scaled = proposal.convert("xyxy").bbox.clone()
         scaled[:, 0] *= ratio_width
         scaled[:, 2] *= ratio_width
@@ -209,13 +299,27 @@ class RelationUnionFeatureExtractor(nn.Module):
         scaled[:, 3] *= ratio_height
         return BoxList(scaled, (self.rect_size, self.rect_size), "xyxy")
 
-    def _encode_obb_rectangles(self, head_boxes: torch.Tensor, tail_boxes: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_obb_rectangles(
+        self,
+        head_boxes: torch.Tensor,
+        tail_boxes: torch.Tensor,
+        device: torch.device,
+        angle_unit: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         num_rel = head_boxes.size(0)
         if num_rel == 0:
             empty = torch.zeros((0, self.rect_size, self.rect_size), device=device)
             return empty, empty
-        head_polys = obb2poly(head_boxes, version=self.angle_version).view(-1, 4, 2).detach().cpu().numpy()
-        tail_polys = obb2poly(tail_boxes, version=self.angle_version).view(-1, 4, 2).detach().cpu().numpy()
+        if self.use_rpcm_legacy_union:
+            head_boxes_rad = head_boxes.clone()
+            tail_boxes_rad = tail_boxes.clone()
+            head_boxes_rad[:, 4] = angle_to_radians(head_boxes_rad[:, 4], angle_unit)
+            tail_boxes_rad[:, 4] = angle_to_radians(tail_boxes_rad[:, 4], angle_unit)
+            head_polys = _legacy_obb2poly_le90_rad(head_boxes_rad).view(-1, 4, 2).detach().cpu().numpy()
+            tail_polys = _legacy_obb2poly_le90_rad(tail_boxes_rad).view(-1, 4, 2).detach().cpu().numpy()
+        else:
+            head_polys = obb2poly(head_boxes, version=self.angle_version, angle_unit=angle_unit).view(-1, 4, 2).detach().cpu().numpy()
+            tail_polys = obb2poly(tail_boxes, version=self.angle_version, angle_unit=angle_unit).view(-1, 4, 2).detach().cpu().numpy()
         head_centers = head_boxes[:, :2].detach().cpu().numpy()
         tail_centers = tail_boxes[:, :2].detach().cpu().numpy()
         head_x = np.where(head_polys[:, :, 0] <= head_centers[:, None, 0], np.floor(head_polys[:, :, 0]), np.ceil(head_polys[:, :, 0]))
@@ -261,12 +365,20 @@ class RelationUnionFeatureExtractor(nn.Module):
                 box_dim = 5 if self.box_mode == "obb" else 4
                 mode = "xywha" if self.box_mode == "obb" else "xyxy"
                 union_proposals.append(BoxList(proposal.bbox.new_zeros((0, box_dim)), proposal.size, mode))
+                if mode == "xywha":
+                    set_boxlist_angle_unit(union_proposals[-1], get_boxlist_angle_unit(proposal))
                 continue
             head_proposal = proposal[pair_idx[:, 0]]
             tail_proposal = proposal[pair_idx[:, 1]]
             if proposal.mode == "xywha":
-                union_boxes = _enclosing_union_obb(head_proposal.bbox, tail_proposal.bbox, self.angle_version)
-                union_proposals.append(BoxList(union_boxes, proposal.size, "xywha"))
+                angle_unit = get_boxlist_angle_unit(proposal)
+                if self.use_rpcm_legacy_union:
+                    union_boxes = _legacy_union_obb(head_proposal.bbox, tail_proposal.bbox, angle_unit)
+                else:
+                    union_boxes = _enclosing_union_obb(head_proposal.bbox, tail_proposal.bbox, self.angle_version, angle_unit)
+                union_boxlist = BoxList(union_boxes, proposal.size, "xywha")
+                set_boxlist_angle_unit(union_boxlist, angle_unit)
+                union_proposals.append(union_boxlist)
             else:
                 union_boxes = torch.stack(
                     [
@@ -281,7 +393,12 @@ class RelationUnionFeatureExtractor(nn.Module):
             head_rect_prop = self._resize_proposal_for_rect(head_proposal)
             tail_rect_prop = self._resize_proposal_for_rect(tail_proposal)
             if proposal.mode == "xywha":
-                head_rect, tail_rect = self._encode_obb_rectangles(head_rect_prop.bbox, tail_rect_prop.bbox, feature_device)
+                head_rect, tail_rect = self._encode_obb_rectangles(
+                    head_rect_prop.bbox,
+                    tail_rect_prop.bbox,
+                    feature_device,
+                    get_boxlist_angle_unit(proposal),
+                )
             else:
                 head_rect, tail_rect = self._encode_hbb_rectangles(head_rect_prop.bbox, tail_rect_prop.bbox, feature_device)
             rect_inputs.append(torch.stack((head_rect, tail_rect), dim=1))

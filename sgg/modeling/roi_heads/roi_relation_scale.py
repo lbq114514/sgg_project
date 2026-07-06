@@ -5,6 +5,8 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
+from sgg.modeling.core.obb_ops import angle_to_radians, get_boxlist_angle_unit
+
 
 def proposal_box_tensor(proposal):
     if proposal.mode in {"xyxy", "xywh", "xywha"}:
@@ -54,7 +56,10 @@ def encode_pair_scale_info(proposals: Sequence, rel_pair_idxs) -> torch.Tensor:
         )
         union_area = (union_wh[:, :1] * union_wh[:, 1:2]).clamp(min=1e-6)
         center_dist = torch.norm(obj_ctr - subj_ctr, dim=1, keepdim=True)
-        angle_delta = torch.deg2rad(angle[pair_idx[:, 1]] - angle[pair_idx[:, 0]])
+        angle_delta = angle_to_radians(
+            angle[pair_idx[:, 1]] - angle[pair_idx[:, 0]],
+            get_boxlist_angle_unit(proposal),
+        )
         scale_info = torch.cat(
             [
                 torch.log(subj_area),

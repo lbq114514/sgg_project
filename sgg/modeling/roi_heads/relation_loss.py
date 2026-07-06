@@ -15,6 +15,8 @@ class RelationLossEvaluator:
         self.cb_beta = float(rel_cfg.get("PREDICATE_CLASS_BALANCED_BETA", 0.999))
         self.bg_loss_weight = float(rel_cfg.get("PREDICATE_BG_LOSS_WEIGHT", 1.0))
         self.logit_adjust_tau = float(rel_cfg.get("PREDICATE_LOGIT_ADJUST_TAU", 1.0))
+        self.aux_logit_adjust_weight = float(rel_cfg.get("PREDICATE_AUX_LOGIT_ADJUST_WEIGHT", 0.0))
+        self.aux_logit_adjust_tau = float(rel_cfg.get("PREDICATE_AUX_LOGIT_ADJUST_TAU", 0.5))
         counts = rel_cfg.get("PREDICATE_COUNTS", [])
         self.predicate_counts = [int(v) for v in counts] if counts else []
         self.obj_loss_weight = float(rel_cfg.get("OBJECT_REFINE_LOSS_WEIGHT", 1.0))
@@ -38,12 +40,17 @@ class RelationLossEvaluator:
         weights[0] = self.bg_loss_weight
         return weights
 
-    def _apply_logit_adjustment(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.loss_type != "logit_adjusted" or self.logit_adjust_tau == 0.0:
+    def _logit_adjusted(self, logits: torch.Tensor, tau: float) -> torch.Tensor:
+        if tau == 0.0:
             return logits
         counts = self._counts_tensor(logits.device)
         prior = counts / counts.sum().clamp(min=1.0)
-        return logits + self.logit_adjust_tau * prior.clamp(min=1e-12).log()
+        return logits + float(tau) * prior.clamp(min=1e-12).log()
+
+    def _apply_logit_adjustment(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.loss_type != "logit_adjusted":
+            return logits
+        return self._logit_adjusted(logits, self.logit_adjust_tau)
 
     def __call__(self, proposals: Sequence, rel_labels, relation_logits, refine_logits=None, cls_new=None):
         del cls_new
@@ -64,9 +71,12 @@ class RelationLossEvaluator:
             loss_relation = torch.zeros((), device=device)
         else:
             labels = rel_labels.clamp(min=0, max=self.num_rel_classes - 1)
-            relation_logits = self._apply_logit_adjustment(relation_logits)
+            main_logits = self._apply_logit_adjustment(relation_logits)
             weight = self._class_balanced_weight(relation_logits.device) if self.loss_type == "class_balanced" else None
-            loss_relation = F.cross_entropy(relation_logits, labels, weight=weight)
+            loss_relation = F.cross_entropy(main_logits, labels, weight=weight)
+            if self.aux_logit_adjust_weight > 0.0:
+                aux_logits = self._logit_adjusted(relation_logits, self.aux_logit_adjust_tau)
+                loss_relation = loss_relation + self.aux_logit_adjust_weight * F.cross_entropy(aux_logits, labels)
 
         loss_refine_obj = None
         if refine_logits is not None:

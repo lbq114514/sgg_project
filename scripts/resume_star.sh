@@ -6,11 +6,12 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-pyg}"
-CONFIG="${CONFIG:-configs/star_predcls_obb_train.py}"
+CONFIG="${CONFIG:-configs/star_predcls_obb_rpcm_legacy_ppg_6850_train.py}"
 DEVICE="${DEVICE:-cuda}"
-RESUME="${RESUME:-outputs/star_predcls_obb_train/model_last.pth}"
-LOG_FILE="${LOG_FILE:-star_train_resume.log}"
-START_EPOCH=44
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_rpcm_legacy_ppg_6850}"
+RESUME="${RESUME:-${OUTPUT_DIR}/model_last.pth}"
+LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/resume.log}"
+START_EPOCH="${START_EPOCH:-}"
 
 cd "${ROOT_DIR}"
 if [[ ! -f "${RESUME}" ]]; then
@@ -21,13 +22,14 @@ fi
 source "${CONDA_SH}"
 conda activate "${CONDA_ENV}"
 
-nohup python train.py \
-  --config "${CONFIG}" \
-  --device "${DEVICE}" \
-  --resume "${RESUME}" \
-  --start-epoch "${START_EPOCH}" \
-  >> "${LOG_FILE}" 2>&1 &
+cmd=(python train.py --config "${CONFIG}" --device "${DEVICE}" --resume "${RESUME}")
+if [[ -n "${START_EPOCH}" ]]; then
+  cmd+=(--start-epoch "${START_EPOCH}")
+fi
+
+nohup "${cmd[@]}" >> "${LOG_FILE}" 2>&1 &
 
 echo "Resumed training with PID $!"
+echo "Config: ${CONFIG}"
 echo "Checkpoint: ${RESUME}"
 echo "Log: ${LOG_FILE}"

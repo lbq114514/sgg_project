@@ -75,20 +75,22 @@ Train on STAR-SGG:
 
 ```bash
 export STAR_SGG_ROOT=/path/to/STAR_SGG
-python train.py --config configs/star_predcls_obb_train.py --device cuda
+bash scripts/run_star_experiment.sh
 ```
 
 Evaluate a checkpoint:
 
 ```bash
 export STAR_SGG_ROOT=/path/to/STAR_SGG
-python eval.py \
-  --config configs/star_predcls_obb_train.py \
-  --checkpoint /path/to/model.pth \
-  --device cuda
+bash scripts/eval_once.sh
 ```
 
-The scripts in `scripts/` support background experiment runs, resume workflows, and analysis. Their conda environment and paths can be overridden through environment variables documented at the top of each script.
+The active STAR experiment path is the aligned RPCM LEGACY + PPG predcls setup. The scripts in `scripts/` are intentionally kept small:
+
+- `run_star_experiment.sh`: launch the main aligned RPCM LEGACY training flow.
+- `eval_once.sh`: evaluate the aligned RPCM LEGACY checkpoint.
+- `resume_star.sh`: resume the aligned RPCM LEGACY training flow.
+- `dump_rpcm_current_probe.py`, `dump_rpcm_original_probe.py`, `compare_rpcm_probe_dumps.py`: one-image numeric alignment tools for checking the current implementation against the original RPCM repository.
 
 ## Reproducibility notes
 

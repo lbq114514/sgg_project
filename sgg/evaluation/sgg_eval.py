@@ -40,6 +40,7 @@ class SGGResult:
     predicate_pair_cls_confusion: Dict[int, Dict[int, int]] = field(default_factory=dict)
     candidate_stage_coverage: Dict[str, float] = field(default_factory=dict)
     predicate_candidate_stage_coverage: Dict[str, Dict[int, float]] = field(default_factory=dict)
+    vehicle_aux_stats: Dict[int, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -519,6 +520,10 @@ def evaluate_sgg(
     candidate_stage_hits = {"semantic": 0, "ppn": 0, "degree_cap": 0, "final": 0}
     predicate_candidate_hits = {stage: {} for stage in candidate_stage_hits}
     predicate_candidate_total: Dict[int, int] = {}
+    predicate_pair_cls_confusion: Dict[int, Dict[int, int]] = {}
+    vehicle_aux_total: Dict[int, int] = {}
+    vehicle_aux_hits: Dict[int, int] = {}
+    vehicle_aux_logit_sum: Dict[int, float] = {}
     candidate_stage_total = 0
 
     for pred, target in zip(predictions, targets):
@@ -567,6 +572,47 @@ def evaluate_sgg(
             predicate_counts[predicate] = predicate_counts.get(predicate, 0) + 1
 
         sorted_pairs, sorted_rels, sorted_rel_scores, _ = _graph_constrained_predictions(ctx)
+        if pred.has_field("vehicle_aux_logits") and pred.has_field("vehicle_aux_predicates"):
+            aux_logits = pred.get_field("vehicle_aux_logits").float()
+            aux_predicates = pred.get_field("vehicle_aux_predicates").long().tolist()
+            aux_cols = {int(predicate): col for col, predicate in enumerate(aux_predicates)}
+            raw_rels = (
+                target.get_field("all_relation_triplets").long()
+                if target.has_field("all_relation_triplets")
+                else ctx.gt_rels
+            )
+            pair_to_row = {
+                (int(pair[0]), int(pair[1])): row
+                for row, pair in enumerate(ctx.pred_pair_idx.tolist()[: aux_logits.size(0)])
+            }
+            for head, tail, predicate in raw_rels.tolist():
+                col = aux_cols.get(int(predicate))
+                row = pair_to_row.get((int(head), int(tail)))
+                if col is None or row is None:
+                    continue
+                value = float(aux_logits[row, col].item())
+                vehicle_aux_total[int(predicate)] = vehicle_aux_total.get(int(predicate), 0) + 1
+                vehicle_aux_hits[int(predicate)] = vehicle_aux_hits.get(int(predicate), 0) + int(value > 0.0)
+                vehicle_aux_logit_sum[int(predicate)] = vehicle_aux_logit_sum.get(int(predicate), 0.0) + value
+        pair_to_predicate: Dict[Tuple[int, int], int] = {}
+        pair_to_score: Dict[Tuple[int, int], float] = {}
+        for pair, predicate, score in zip(
+            sorted_pairs.tolist(),
+            sorted_rels.tolist(),
+            sorted_rel_scores.tolist(),
+        ):
+            key = (int(pair[0]), int(pair[1]))
+            if key not in pair_to_predicate or float(score) > pair_to_score[key]:
+                pair_to_predicate[key] = int(predicate)
+                pair_to_score[key] = float(score)
+        for head, tail, predicate in gt_rows:
+            key = (int(head), int(tail))
+            if key in pair_to_predicate:
+                gt_predicate = int(predicate)
+                pred_predicate = int(pair_to_predicate[key])
+                bucket = predicate_pair_cls_confusion.setdefault(gt_predicate, {})
+                bucket[pred_predicate] = bucket.get(pred_predicate, 0) + 1
+
         use_gt_boxes = mode in {"predcls", "sgcls"}
         pred_to_gt = _match_predictions(
             ctx,
@@ -646,5 +692,17 @@ def evaluate_sgg(
                 for predicate, total in predicate_candidate_total.items()
             }
             for stage, hits in predicate_candidate_hits.items()
+        },
+        predicate_pair_cls_confusion={
+            int(predicate): {int(predicted): int(count) for predicted, count in predicted_counts.items()}
+            for predicate, predicted_counts in predicate_pair_cls_confusion.items()
+        },
+        vehicle_aux_stats={
+            int(predicate): {
+                "pos": float(total),
+                "aux_recall_at_0": float(vehicle_aux_hits.get(predicate, 0) / max(total, 1)),
+                "avg_logit": float(vehicle_aux_logit_sum.get(predicate, 0.0) / max(total, 1)),
+            }
+            for predicate, total in vehicle_aux_total.items()
         },
     )

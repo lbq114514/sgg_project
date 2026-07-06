@@ -1,4 +1,5 @@
 import torch
+from sgg.modeling.core.obb_ops import angle_to_radians, get_boxlist_angle_unit
 from sgg.structures.boxes import BoxList
 
 
@@ -38,7 +39,7 @@ def pair_geometry_features(boxlist: BoxList) -> torch.Tensor:
 
     ai_ang = boxes[:, 4][:, None].expand(n, n).unsqueeze(-1)
     aj_ang = boxes[:, 4][None, :].expand(n, n).unsqueeze(-1)
-    angle_delta = (aj_ang - ai_ang) / 180.0
+    angle_delta = angle_to_radians(aj_ang - ai_ang, get_boxlist_angle_unit(boxlist)) / torch.pi
     wh_i = boxes[:, 2:4][:, None, :].expand(n, n, 2).clamp(min=1e-6)
     wh_j = boxes[None, :, 2:4].expand(n, n, 2).clamp(min=1e-6)
     scale = torch.log(wh_j / wh_i)

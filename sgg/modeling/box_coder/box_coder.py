@@ -1,7 +1,7 @@
 import math
 import torch
 
-from ..core.obb_ops import norm_angle, obb2poly, obb2xyxy, poly2obb
+from ..core.obb_ops import angle_to_radians, normalize_angle_unit, norm_angle, obb2poly, obb2xyxy, poly2obb
 
 
 class HorizontalBoxCoder:
@@ -234,7 +234,7 @@ class DeltaXYWHAOBBoxCoder:
     Delta coder for rotated boxes in ``xywha`` format.
 
     This mirrors mmrotate's ``DeltaXYWHAOBBoxCoder`` but stays dependency-light
-    and follows the project's degree-valued angle convention.
+    and follows the configured angle convention.
     """
 
     def __init__(
@@ -247,6 +247,7 @@ class DeltaXYWHAOBBoxCoder:
         proj_xy=False,
         add_ctr_clamp=False,
         ctr_clamp=32,
+        angle_unit="degree",
     ):
         self.means = target_means
         self.stds = target_stds
@@ -256,6 +257,7 @@ class DeltaXYWHAOBBoxCoder:
         self.proj_xy = proj_xy
         self.add_ctr_clamp = add_ctr_clamp
         self.ctr_clamp = ctr_clamp
+        self.angle_unit = normalize_angle_unit(angle_unit)
 
     def encode(self, bboxes, gt_bboxes):
         assert bboxes.size(0) == gt_bboxes.size(0)
@@ -270,6 +272,7 @@ class DeltaXYWHAOBBoxCoder:
             self.norm_factor,
             self.edge_swap,
             self.proj_xy,
+            self.angle_unit,
         )
 
     def decode(self, bboxes, pred_bboxes, max_shape=None, wh_ratio_clip=16 / 1000):
@@ -287,6 +290,7 @@ class DeltaXYWHAOBBoxCoder:
             self.norm_factor,
             self.edge_swap,
             self.proj_xy,
+            self.angle_unit,
         )
 
     @staticmethod
@@ -299,6 +303,7 @@ class DeltaXYWHAOBBoxCoder:
         norm_factor,
         edge_swap,
         proj_xy,
+        angle_unit,
     ):
         proposals = proposals.float()
         gt = gt.float()
@@ -313,16 +318,17 @@ class DeltaXYWHAOBBoxCoder:
         gh = gh.clamp(min=eps)
 
         if proj_xy:
-            pa_rad = torch.deg2rad(pa)
+            pa_rad = angle_to_radians(pa, angle_unit)
             dx = (torch.cos(pa_rad) * (gx - px) + torch.sin(pa_rad) * (gy - py)) / pw
             dy = (-torch.sin(pa_rad) * (gx - px) + torch.cos(pa_rad) * (gy - py)) / ph
         else:
             dx = (gx - px) / pw
             dy = (gy - py) / ph
 
+        right_angle = math.pi / 2 if normalize_angle_unit(angle_unit) == "radian" else 90.0
         if edge_swap:
-            dtheta1 = norm_angle(ga - pa, angle_range)
-            dtheta2 = norm_angle(ga - pa + 90.0, angle_range)
+            dtheta1 = norm_angle(ga - pa, angle_range, angle_unit=angle_unit)
+            dtheta2 = norm_angle(ga - pa + right_angle, angle_range, angle_unit=angle_unit)
             abs_dtheta1 = torch.abs(dtheta1)
             abs_dtheta2 = torch.abs(dtheta2)
             use_primary = abs_dtheta1 < abs_dtheta2
@@ -332,12 +338,13 @@ class DeltaXYWHAOBBoxCoder:
             dw = torch.log(gw_regular / pw)
             dh = torch.log(gh_regular / ph)
         else:
-            da = norm_angle(ga - pa, angle_range)
+            da = norm_angle(ga - pa, angle_range, angle_unit=angle_unit)
             dw = torch.log(gw / pw)
             dh = torch.log(gh / ph)
 
         if norm_factor is not None:
-            da = da / (norm_factor * 180.0)
+            unit_range = math.pi if normalize_angle_unit(angle_unit) == "radian" else 180.0
+            da = da / (norm_factor * unit_range)
 
         deltas = torch.stack([dx, dy, dw, dh, da], dim=-1)
         means = deltas.new_tensor(means).unsqueeze(0)
@@ -358,6 +365,7 @@ class DeltaXYWHAOBBoxCoder:
         norm_factor,
         edge_swap,
         proj_xy,
+        angle_unit,
     ):
         means = deltas.new_tensor(means).view(1, -1).repeat(1, deltas.size(1) // 5)
         stds = deltas.new_tensor(stds).view(1, -1).repeat(1, deltas.size(1) // 5)
@@ -370,7 +378,8 @@ class DeltaXYWHAOBBoxCoder:
         da = denorm_deltas[:, 4::5]
 
         if norm_factor is not None:
-            da = da * (norm_factor * 180.0)
+            unit_range = math.pi if normalize_angle_unit(angle_unit) == "radian" else 180.0
+            da = da * (norm_factor * unit_range)
 
         px = rois[:, 0].unsqueeze(1).expand_as(dx)
         py = rois[:, 1].unsqueeze(1).expand_as(dy)
@@ -395,14 +404,14 @@ class DeltaXYWHAOBBoxCoder:
         gh = ph * dh.exp()
 
         if proj_xy:
-            pa_rad = torch.deg2rad(pa)
+            pa_rad = angle_to_radians(pa, angle_unit)
             gx = dx * pw * torch.cos(pa_rad) - dy * ph * torch.sin(pa_rad) + px
             gy = dx * pw * torch.sin(pa_rad) + dy * ph * torch.cos(pa_rad) + py
         else:
             gx = px + dx_width
             gy = py + dy_height
 
-        ga = norm_angle(pa + da, angle_range)
+        ga = norm_angle(pa + da, angle_range, angle_unit=angle_unit)
 
         if max_shape is not None:
             if len(max_shape) >= 2:
@@ -411,11 +420,12 @@ class DeltaXYWHAOBBoxCoder:
                 gy = gy.clamp(min=0, max=h - 1)
 
         if edge_swap:
+            right_angle = math.pi / 2 if normalize_angle_unit(angle_unit) == "radian" else 90.0
             use_regular = gw > gh
             w_regular = torch.where(use_regular, gw, gh)
             h_regular = torch.where(use_regular, gh, gw)
-            theta_regular = torch.where(use_regular, ga, ga + 90.0)
-            theta_regular = norm_angle(theta_regular, angle_range)
+            theta_regular = torch.where(use_regular, ga, ga + right_angle)
+            theta_regular = norm_angle(theta_regular, angle_range, angle_unit=angle_unit)
             return torch.stack([gx, gy, w_regular, h_regular, theta_regular], dim=-1).view_as(deltas)
 
         return torch.stack([gx, gy, gw, gh, ga], dim=-1).view_as(deltas)

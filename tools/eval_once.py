@@ -72,7 +72,166 @@ def parse_args():
         default="",
         help="Checkpoint override for the selected PPG/PPN filter.",
     )
+    parser.add_argument(
+        "--checkpoint-load-mode",
+        choices=("full", "model-only", "legacy-rpcm"),
+        default="full",
+        help=(
+            "full: load model/optimizer/scheduler through Trainer.load_checkpoint; "
+            "model-only: load only model tensors; "
+            "legacy-rpcm: model-only plus safe key remaps for original RPCM checkpoints."
+        ),
+    )
     return parser.parse_args()
+
+
+def _checkpoint_state_dict(ckpt):
+    if isinstance(ckpt, dict):
+        for key in ("model", "state_dict", "module"):
+            value = ckpt.get(key)
+            if isinstance(value, dict):
+                return value
+    return ckpt
+
+
+def _legacy_rpcm_key_candidates(key: str) -> list[str]:
+    candidates = [key]
+    if ".patch_embed.projection." in key:
+        candidates.append(key.replace(".patch_embed.projection.", ".patch_embed.proj."))
+    if key.startswith("roi_heads.relation.PPG."):
+        candidates.append("roi_heads.relation.ppg." + key[len("roi_heads.relation.PPG."):])
+    if key.startswith("roi_heads.relation.union_feature_extractor.feature_extractor.fc6."):
+        candidates.append(
+            "roi_heads.relation.union_feature_extractor.head.1."
+            + key[len("roi_heads.relation.union_feature_extractor.feature_extractor.fc6."):]
+        )
+    if key.startswith("roi_heads.relation.box_feature_extractor.fc6."):
+        candidates.append(
+            "roi_heads.relation.box_feature_extractor.head.1."
+            + key[len("roi_heads.relation.box_feature_extractor.fc6."):]
+        )
+    if key.startswith("roi_heads.box.feature_extractor.fc6."):
+        suffix = key[len("roi_heads.box.feature_extractor.fc6."):]
+        candidates.extend(
+            [
+                "roi_head.bbox_head.shared_fcs.0." + suffix,
+                "roi_head_d2.bbox_head.shared_fcs.0." + suffix,
+            ]
+        )
+    if key.startswith("roi_heads.box.feature_extractor.fc7."):
+        suffix = key[len("roi_heads.box.feature_extractor.fc7."):]
+        candidates.extend(
+            [
+                "roi_head.bbox_head.shared_fcs.1." + suffix,
+                "roi_head_d2.bbox_head.shared_fcs.1." + suffix,
+            ]
+        )
+    if key.startswith("roi_heads.box.predictor.cls_score."):
+        suffix = key[len("roi_heads.box.predictor.cls_score."):]
+        candidates.extend(
+            [
+                "roi_head.bbox_head.fc_cls." + suffix,
+                "roi_head_d2.bbox_head.fc_cls." + suffix,
+            ]
+        )
+    return candidates
+
+
+def load_model_only_checkpoint(trainer: Trainer, path: str, *, legacy_rpcm: bool = False):
+    ckpt = torch.load(path, map_location=trainer.device)
+    source = _checkpoint_state_dict(ckpt)
+    if not isinstance(source, dict):
+        raise TypeError(f"Checkpoint does not contain a model state_dict: {path}")
+
+    target = trainer.model.state_dict()
+    update = {}
+    remapped = {}
+    skipped_shape = []
+    used_source_keys = set()
+    for source_key, source_value in source.items():
+        if source_key not in target:
+            continue
+        if not hasattr(source_value, "shape") or source_value.shape != target[source_key].shape:
+            skipped_shape.append(
+                (
+                    source_key,
+                    source_key,
+                    tuple(source_value.shape) if hasattr(source_value, "shape") else "<no-shape>",
+                    tuple(target[source_key].shape),
+                )
+            )
+            continue
+        update[source_key] = source_value
+        used_source_keys.add(source_key)
+
+    if legacy_rpcm:
+        for source_key, source_value in source.items():
+            candidates = _legacy_rpcm_key_candidates(source_key)[1:]
+            if not candidates:
+                continue
+            loaded_targets = []
+            for target_key in candidates:
+                if target_key not in target or target_key in update:
+                    continue
+                if not hasattr(source_value, "shape") or source_value.shape != target[target_key].shape:
+                    skipped_shape.append(
+                        (
+                            source_key,
+                            target_key,
+                            tuple(source_value.shape) if hasattr(source_value, "shape") else "<no-shape>",
+                            tuple(target[target_key].shape),
+                        )
+                    )
+                    continue
+                update[target_key] = source_value
+                loaded_targets.append(target_key)
+            if loaded_targets:
+                used_source_keys.add(source_key)
+                remapped[source_key] = loaded_targets
+
+    merged = dict(target)
+    merged.update(update)
+    incompatible = trainer.model.load_state_dict(merged, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Internal model-only checkpoint load failed unexpectedly: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
+
+    filter_prefixes = (
+        "roi_heads.relation.ppg.",
+        "roi_heads.relation.ppn.",
+    )
+    unloaded_target = [
+        key for key in target
+        if key not in update and not key.startswith(filter_prefixes)
+    ]
+    unused_source = [
+        key for key in source
+        if key not in used_source_keys and not key.startswith("roi_heads.relation.PPG_HBB.")
+    ]
+    print(
+        "Model-only checkpoint load:",
+        {
+            "checkpoint": path,
+            "loaded": len(update),
+            "remapped": len(remapped),
+            "unloaded_target": len(unloaded_target),
+            "unused_source": len(unused_source),
+            "skipped_shape": len(skipped_shape),
+            "mode": "legacy-rpcm" if legacy_rpcm else "model-only",
+        },
+        flush=True,
+    )
+    if remapped:
+        print("Legacy key remaps:", list(remapped.items())[:20], flush=True)
+    if unloaded_target:
+        print("Unloaded target keys sample:", unloaded_target[:30], flush=True)
+    if unused_source:
+        print("Unused source keys sample:", unused_source[:30], flush=True)
+    if skipped_shape:
+        print("Skipped shape mismatch sample:", skipped_shape[:20], flush=True)
+    return ckpt
 
 
 def main():
@@ -123,7 +282,14 @@ def main():
 
     model = SceneGraphDetector(cfg)
     trainer = Trainer(cfg, model, device=args.device, dataloaders=dataloaders)
-    trainer.load_checkpoint(args.checkpoint)
+    if args.checkpoint_load_mode == "full":
+        trainer.load_checkpoint(args.checkpoint)
+    elif args.checkpoint_load_mode == "model-only":
+        load_model_only_checkpoint(trainer, args.checkpoint, legacy_rpcm=False)
+    elif args.checkpoint_load_mode == "legacy-rpcm":
+        load_model_only_checkpoint(trainer, args.checkpoint, legacy_rpcm=True)
+    else:
+        raise ValueError(f"Unknown checkpoint load mode: {args.checkpoint_load_mode}")
 
     metrics, _ = trainer.evaluate_loader(dataloaders[split], return_result=True)
 

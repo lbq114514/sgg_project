@@ -1,18 +1,18 @@
 import torch
 
 from .boxlist import BoxList
+from sgg.modeling.core.obb_ops import (
+    ANGLE_UNIT_FIELD,
+    convert_obb_angle_unit,
+    get_boxlist_angle_unit,
+    obb2xyxy,
+)
 
 try:
     from mmcv.ops import box_iou_rotated, nms_rotated
 except Exception:
     box_iou_rotated = None
     nms_rotated = None
-
-try:
-    from mmrotate.core import obb2xyxy
-except Exception:
-    obb2xyxy = None
-
 
 def _nms_hbb(boxes: torch.Tensor, scores: torch.Tensor, nms_thresh: float) -> torch.Tensor:
     if boxes.numel() == 0:
@@ -85,7 +85,9 @@ def boxlist_iou(boxlist1, boxlist2, mode="auto"):
         if boxlist1.mode != "xywha" or boxlist2.mode != "xywha":
             raise ValueError("OBB IoU requires both BoxLists in 'xywha' mode")
 
-        return box_iou_rotated(boxlist1.bbox, boxlist2.bbox)
+        boxes1 = convert_obb_angle_unit(boxlist1.bbox, get_boxlist_angle_unit(boxlist1), "radian")
+        boxes2 = convert_obb_angle_unit(boxlist2.bbox, get_boxlist_angle_unit(boxlist2), "radian")
+        return box_iou_rotated(boxes1, boxes2)
 
     else:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -123,7 +125,8 @@ def boxlist_nms(boxlist, nms_thresh, max_proposals=-1, score_field="scores", mod
         if boxlist.mode != "xywha":
             raise ValueError("OBB NMS requires BoxList in 'xywha' mode")
 
-        dets, keep = nms_rotated(boxlist.bbox, scores, nms_thresh)
+        boxes = convert_obb_angle_unit(boxlist.bbox, get_boxlist_angle_unit(boxlist), "radian")
+        _, keep = nms_rotated(boxes, scores, nms_thresh)
 
     else:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -185,6 +188,8 @@ def cat_boxlist(boxlists):
         data = [b.get_field(field) for b in boxlists]
         if torch.is_tensor(data[0]):
             cat_data = torch.cat(data, dim=0)
+        elif all(item == data[0] for item in data):
+            cat_data = data[0]
         else:
             cat_data = sum(data, [])
         cat_boxes.add_field(field, cat_data)
@@ -198,10 +203,7 @@ def obb_to_hbb(boxlist, version="oc"):
     """
     if boxlist.mode != "xywha":
         raise ValueError("obb_to_hbb expects BoxList in 'xywha' mode")
-    if obb2xyxy is None:
-        raise ImportError("mmrotate.core.obb2xyxy is required for OBB->HBB conversion")
-
-    hbb = obb2xyxy(boxlist.bbox, version)
+    hbb = obb2xyxy(boxlist.bbox, version, angle_unit=get_boxlist_angle_unit(boxlist))
     new_boxlist = BoxList(hbb, boxlist.size, mode="xyxy")
 
     for k, v in boxlist.extra_fields.items():

@@ -5,6 +5,7 @@ def get_default_cfg():
     cfg = {
         "MODEL": {
             "BOX_MODE": "hbb",  # hbb | obb
+            "OBB_ANGLE_UNIT": "degree",  # degree | radian
             "TASK": "sgdet",  # predcls | sgcls | sgdet
             "NUM_CLASSES": 49,
             "NUM_PREDICATES": 59,
@@ -66,6 +67,8 @@ def get_default_cfg():
                 "TEST_SUBGRAPH_COMPLETION_TOPK": 0,
                 "POSITIVE_FRACTION": 0.25,
                 "PREDICT_USE_VISION": True,
+                "PREDICT_USE_BIAS": False,
+                "BIAS_LAMBDA": 0.0,
                 "REQUIRE_BOX_OVERLAP": False,
                 "PREDICTOR": "UNIMPLEMENTED",
                 "CONTEXT_HIDDEN_DIM": 512,
@@ -82,6 +85,8 @@ def get_default_cfg():
                 "RPCM_USE_PROTOTYPE": True,
                 "RPCM_PROTO_MOMENTUM": 0.9,
                 "RPCM_PROTO_INIT": "semantic",
+                "RPCM_PROTO_EMBED_DIM": 0,
+                "RPCM_PROTO_GLOVE_PATH": "",
                 "RPCM_OBJ_PROTO_INIT": "semantic",
                 "RPCM_PAIR_LABEL_PRIOR": True,
                 "RPCM_PAIR_PRIOR_DIM": 128,
@@ -108,6 +113,8 @@ def get_default_cfg():
                 "PREDICATE_CLASS_BALANCED_BETA": 0.999,
                 "PREDICATE_BG_LOSS_WEIGHT": 1.0,
                 "PREDICATE_LOGIT_ADJUST_TAU": 1.0,
+                "PREDICATE_AUX_LOGIT_ADJUST_WEIGHT": 0.0,
+                "PREDICATE_AUX_LOGIT_ADJUST_TAU": 0.5,
                 "PREDICATE_COUNTS": [],
                 "NUM_SAMPLE_PER_GT_REL": 4,
                 "TAIL_AWARE_POS_SAMPLING": False,
@@ -131,6 +138,8 @@ def get_default_cfg():
                 "PPN_PAIR_THRESHOLD": 10000,
                 "PPN_TOPK": 10000,
                 "PPN_CHUNK_SIZE": 200000,
+                "RPCM_LEGACY_FILTER_FLOW": False,
+                "RPCM_LEGACY_UNION_BOX": False,
                 "GRAPH_TOPK": 10000,
                 "GRAPH_PARTITION_SIZE": 2000,
                 "GRAPH_MAX_DEGREE": 48,
@@ -146,6 +155,11 @@ def get_default_cfg():
                 "TYPED_LOGIC_LOSS_WEIGHT": 0.1,
             "TYPED_HIERARCHY_LOGIT_WEIGHT": 1.0,
                 "TYPED_PROTO_LOGIT_WEIGHT": 0.0,
+                "TYPED_VEHICLE_AUX_ENABLED": False,
+                "TYPED_VEHICLE_AUX_LOSS_WEIGHT": 0.2,
+                "TYPED_VEHICLE_LOGIT_MAX_WEIGHT": 0.5,
+                "TYPED_VEHICLE_LOGIT_INIT": 0.0,
+                "TYPED_VEHICLE_PREDICATES": [6, 11, 31, 37, 38, 39, 41],
                 "TYPED_HYPERGRAPH_ENABLED": False,
                 "TYPED_HYPERGRAPH_LAYERS": 2,
                 "TYPED_HYPERGRAPH_HEADS": 4,
@@ -208,6 +222,7 @@ def get_default_cfg():
             "VAL_BATCH_SIZE": 4,
             "TEST_BATCH_SIZE": 4,
             "NUM_WORKERS": 6,
+            "SIZE_DIVISIBLE": 0,
         },
         "SOLVER": {
             "GRADIENT_ACCUMULATION_STEPS": 1,
@@ -229,6 +244,7 @@ def get_default_cfg():
             "CHECKPOINT_PERIOD": 1,
             "VAL_PERIOD": 1,
             "VAL_START_PERIOD": 0,
+            "VAL_SPLIT": "val",
             "PRINT_GRAD_FREQ": 0,
             "GRAD_NORM_CLIP": 5.0,
             "SCHEDULE": {

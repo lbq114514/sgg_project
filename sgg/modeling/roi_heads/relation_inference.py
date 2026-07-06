@@ -89,6 +89,8 @@ class RelationPostProcessor:
             if rel_logit is None or rel_logit.numel() == 0 or pair_idx.numel() == 0:
                 boxlist.add_field("pred_rel_scores", boxlist.bbox.new_zeros((0, 1)))
                 boxlist.add_field("pred_rel_labels", torch.zeros((0,), dtype=torch.long, device=boxlist.bbox.device))
+                if boxlist.has_field("vehicle_aux_logits"):
+                    boxlist.add_field("vehicle_aux_logits", boxlist.get_field("vehicle_aux_logits")[:0])
                 results.append(boxlist)
                 continue
 
@@ -115,6 +117,10 @@ class RelationPostProcessor:
             boxlist.add_field("rel_pair_idxs", pair_idx[sorting_idx])
             boxlist.add_field("pred_rel_scores", rel_scores[sorting_idx])
             boxlist.add_field("pred_rel_labels", rel_label[sorting_idx])
+            if boxlist.has_field("vehicle_aux_logits"):
+                vehicle_aux_logits = boxlist.get_field("vehicle_aux_logits")
+                if vehicle_aux_logits.numel() > 0 and vehicle_aux_logits.size(0) >= sorting_idx.numel():
+                    boxlist.add_field("vehicle_aux_logits", vehicle_aux_logits[: sorting_idx.numel()][sorting_idx])
             results.append(boxlist)
         return results
 

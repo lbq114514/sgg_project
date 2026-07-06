@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 
+from sgg.modeling.core.obb_ops import convert_obb_angle_unit, get_boxlist_angle_unit
 from sgg.modeling.layers.roi_align import MultiScaleROIAlign
 from sgg.structures.boxlist import BoxList
 from sgg.structures.boxlist_ops import obb_to_hbb
@@ -121,6 +122,8 @@ class RotatedROIExtractor(nn.Module):
             boxes = boxlist.bbox
             if boxes.numel() == 0:
                 continue
+            if boxlist.mode == "xywha":
+                boxes = convert_obb_angle_unit(boxes, get_boxlist_angle_unit(boxlist), "radian")
             device = boxes.device
             dtype = boxes.dtype
             img_inds = torch.full((boxes.shape[0], 1), batch_idx, dtype=dtype, device=device)

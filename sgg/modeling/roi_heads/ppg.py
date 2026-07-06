@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from mmcv.ops import box_iou_rotated
 
+from sgg.modeling.core.obb_ops import convert_obb_angle_unit, get_boxlist_angle_unit
 from sgg.structures.boxes import BoxList
 from sgg.structures.boxlist_ops import boxlist_iou
 
@@ -116,6 +117,7 @@ class PairProposalGenerator(nn.Module):
     def _filter_oriented(self, proposal: BoxList, pair_idx: torch.Tensor) -> torch.Tensor:
         obj_labels = proposal.get_field("labels").long()
         obj_boxes = proposal.bbox.to(dtype=torch.float32)
+        angle_unit = get_boxlist_angle_unit(proposal)
         img_size = proposal.size
         losses = []
         self.model1.to(pair_idx.device)
@@ -124,12 +126,14 @@ class PairProposalGenerator(nn.Module):
             chunk = pair_idx[start : start + self.chunk_size]
             head_boxes = obj_boxes[chunk[:, 0]]
             tail_boxes = obj_boxes[chunk[:, 1]]
+            head_boxes_rad = convert_obb_angle_unit(head_boxes, angle_unit, "radian")
+            tail_boxes_rad = convert_obb_angle_unit(tail_boxes, angle_unit, "radian")
             head_labels = obj_labels[chunk[:, 0]]
             tail_labels = obj_labels[chunk[:, 1]]
-            head_polys = self._rotated_box_vertices(head_boxes)
-            tail_polys = self._rotated_box_vertices(tail_boxes)
+            head_polys = self._rotated_box_vertices(head_boxes_rad)
+            tail_polys = self._rotated_box_vertices(tail_boxes_rad)
             pair_meta = torch.cat((head_polys, tail_polys, head_labels[:, None], tail_labels[:, None]), dim=1)
-            features = self._build_oriented_features(head_boxes, tail_boxes, pair_meta, img_size)
+            features = self._build_oriented_features(head_boxes_rad, tail_boxes_rad, pair_meta, img_size)
             losses.append(self._compute_chunk_losses(features))
         keep = self._select_keep_indices(losses, pair_idx.device)
         return pair_idx[keep]

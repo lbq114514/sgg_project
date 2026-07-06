@@ -510,10 +510,20 @@ class PairwiseFeatureExtractor(nn.Module):
         self.pooling_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "CONTEXT_POOLING_DIM", default=in_channels))
         self.embed_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "EMBED_DIM", default=200))
         self.num_obj_classes = int(_cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "NUM_CLASSES", default=1))
+        self.embed_extra_background = bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "PAIRWISE_EMBED_EXTRA_BACKGROUND",
+                default=True,
+            )
+        )
+        self.obj_embed_num_classes = self.num_obj_classes + (1 if self.embed_extra_background else 0)
         self.class_names = list(_cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "CLASS_NAMES", default=[]))
-        if len(self.class_names) < self.num_obj_classes + 1:
+        if len(self.class_names) < self.obj_embed_num_classes:
             self.class_names = self.class_names + [
-                f"class_{idx}" for idx in range(len(self.class_names), self.num_obj_classes + 1)
+                f"class_{idx}" for idx in range(len(self.class_names), self.obj_embed_num_classes)
             ]
         self.rel_feature_type = _cfg_get(
             cfg,
@@ -550,8 +560,8 @@ class PairwiseFeatureExtractor(nn.Module):
             nn.ReLU(inplace=True),
         )
         if self.word_embed_feats_on:
-            self.obj_embed_on_prob_dist = nn.Embedding(self.num_obj_classes + 1, self.embed_dim)
-            self.obj_embed_on_pred_label = nn.Embedding(self.num_obj_classes + 1, self.embed_dim)
+            self.obj_embed_on_prob_dist = nn.Embedding(self.obj_embed_num_classes, self.embed_dim)
+            self.obj_embed_on_pred_label = nn.Embedding(self.obj_embed_num_classes, self.embed_dim)
             obj_embed_init, obj_embed_mask, _ = _build_semantic_prototypes(
                 self.class_names,
                 self.embed_dim,
@@ -616,7 +626,9 @@ class PairwiseFeatureExtractor(nn.Module):
                 device = torch.device("cpu")
             return torch.zeros((sum(len(p) for p in proposals), 0), device=device)
         if self.use_gt_object_label and obj_labels is not None:
-            return self.obj_embed_on_prob_dist(obj_labels.long().clamp(min=0, max=self.num_obj_classes))
+            return self.obj_embed_on_prob_dist(
+                obj_labels.long().clamp(min=0, max=self.obj_embed_num_classes - 1)
+            )
         obj_logits = []
         for proposal in proposals:
             if proposal.has_field("predict_logits"):
@@ -624,8 +636,8 @@ class PairwiseFeatureExtractor(nn.Module):
             else:
                 labels = (
                     proposal.get_field("gt_labels") if proposal.has_field("gt_labels") else proposal.get_field("labels")
-                ).long().clamp(min=0, max=self.num_obj_classes)
-                obj_logits.append(F.one_hot(labels, num_classes=self.num_obj_classes + 1).float())
+                ).long().clamp(min=0, max=self.obj_embed_num_classes - 1)
+                obj_logits.append(F.one_hot(labels, num_classes=self.obj_embed_num_classes).float())
         if not obj_logits:
             weight = self.obj_embed_on_prob_dist.weight
             return weight.new_zeros((0, weight.size(1)))
@@ -635,7 +647,7 @@ class PairwiseFeatureExtractor(nn.Module):
 
     def _get_obj_pred_labels(self, proposals: Sequence, obj_labels: torch.Tensor | None):
         if self.use_gt_object_label and obj_labels is not None:
-            return obj_labels.long().clamp(min=0, max=self.num_obj_classes)
+            return obj_labels.long().clamp(min=0, max=self.obj_embed_num_classes - 1)
         labels = []
         for proposal in proposals:
             if proposal.has_field("pred_labels"):
@@ -644,7 +656,7 @@ class PairwiseFeatureExtractor(nn.Module):
                 labels.append(proposal.get_field("labels").long())
         if not labels:
             return None
-        return torch.cat(labels, dim=0).clamp(min=0, max=self.num_obj_classes)
+        return torch.cat(labels, dim=0).clamp(min=0, max=self.obj_embed_num_classes - 1)
 
     def pairwise_rel_features(
         self,
@@ -711,6 +723,257 @@ class PairwiseFeatureExtractor(nn.Module):
                 rel_features = self.rel_feature_up_dim(union_features) if self.rel_feat_dim_not_match else union_features
         else:
             raise ValueError(f"Unknown EDGE_FEATURES_REPRESENTATION: {self.rel_feature_type}")
+
+        augment_obj_feat = self.obj_feat_aug_finalize_fc(augment_obj_feat)
+        return augment_obj_feat, rel_features
+
+
+def _orig_make_fc(dim_in: int, hidden_dim: int) -> nn.Linear:
+    fc = nn.Linear(dim_in, hidden_dim)
+    nn.init.kaiming_uniform_(fc.weight, a=1)
+    nn.init.constant_(fc.bias, 0)
+    return fc
+
+
+def _orig_obb2xyxy_le90(obboxes: torch.Tensor) -> torch.Tensor:
+    """Original RPCM OBB->HBB helper: angle is already radian."""
+    if obboxes.numel() == 0:
+        return obboxes.new_zeros((obboxes.size(0), 4))
+    center, w, h, theta = torch.split(obboxes, [2, 1, 1, 1], dim=-1)
+    cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+    x_bias = torch.abs(w * 0.5 * cos_t) + torch.abs(h * 0.5 * sin_t)
+    y_bias = torch.abs(w * 0.5 * sin_t) + torch.abs(h * 0.5 * cos_t)
+    bias = torch.cat([x_bias, y_bias], dim=-1)
+    return torch.cat([center - bias, center + bias], dim=-1)
+
+
+def _orig_get_box_info(boxes: torch.Tensor, need_norm: bool = True, proposal=None) -> torch.Tensor:
+    wh = boxes[:, 2:] - boxes[:, :2] + 1.0
+    center_box = torch.cat((boxes[:, :2] + 0.5 * wh, wh), dim=1)
+    box_info = torch.cat((boxes, center_box), dim=1)
+    if need_norm:
+        box_info = box_info / float(max(max(proposal.size[0], proposal.size[1]), 100))
+    return box_info
+
+
+def _orig_get_box_info_or(boxes: torch.Tensor, need_norm: bool = True, proposal=None) -> torch.Tensor:
+    xyxy = _orig_obb2xyxy_le90(boxes)
+    box_info = torch.cat((xyxy, boxes[:, :4]), dim=1)
+    if need_norm:
+        box_info = box_info / float(max(max(proposal.size[0], proposal.size[1]), 100))
+    return box_info
+
+
+def _orig_get_box_pair_info(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
+    unionbox = box1[:, :4].clone()
+    unionbox[:, 0] = torch.min(box1[:, 0], box2[:, 0])
+    unionbox[:, 1] = torch.min(box1[:, 1], box2[:, 1])
+    unionbox[:, 2] = torch.max(box1[:, 2], box2[:, 2])
+    unionbox[:, 3] = torch.max(box1[:, 3], box2[:, 3])
+    union_info = _orig_get_box_info(unionbox, need_norm=False)
+
+    intersection_box = box1[:, :4].clone()
+    intersection_box[:, 0] = torch.max(box1[:, 0], box2[:, 0])
+    intersection_box[:, 1] = torch.max(box1[:, 1], box2[:, 1])
+    intersection_box[:, 2] = torch.min(box1[:, 2], box2[:, 2])
+    intersection_box[:, 3] = torch.min(box1[:, 3], box2[:, 3])
+    case1 = torch.nonzero(intersection_box[:, 2].contiguous().view(-1) < intersection_box[:, 0].contiguous().view(-1)).view(-1)
+    case2 = torch.nonzero(intersection_box[:, 3].contiguous().view(-1) < intersection_box[:, 1].contiguous().view(-1)).view(-1)
+    intersection_info = _orig_get_box_info(intersection_box, need_norm=False)
+    if case1.numel() > 0:
+        intersection_info[case1, :] = 0
+    if case2.numel() > 0:
+        intersection_info[case2, :] = 0
+    return torch.cat((box1, box2, union_info, intersection_info), dim=1)
+
+
+def _orig_encode_orientedbox_info(proposals: Sequence) -> torch.Tensor:
+    infos = []
+    eps = 1e-6
+    for proposal in proposals:
+        boxes = proposal.bbox
+        if boxes.numel() == 0:
+            infos.append(boxes.new_zeros((0, 9)))
+            continue
+        cx, cy, w, h, theta = boxes.split([1, 1, 1, 1, 1], dim=-1)
+        width, height = proposal.size
+        box_diag = torch.sqrt(w ** 2 + h ** 2)
+        img_diag = math.sqrt(width ** 2 + height ** 2)
+        infos.append(
+            torch.cat(
+                [
+                    w / (width + eps),
+                    h / (height + eps),
+                    cx / (width + eps),
+                    cy / (height + eps),
+                    w / (h + eps),
+                    theta,
+                    box_diag / (img_diag + eps),
+                    (w * h) / (width * height + eps),
+                    cx / (cy + eps),
+                ],
+                dim=-1,
+            ).view(-1, 9)
+        )
+    return torch.cat(infos, dim=0) if infos else torch.zeros((0, 9))
+
+
+def _orig_encode_box_info(proposals: Sequence) -> torch.Tensor:
+    if proposals and proposals[0].mode == "xywha":
+        return _orig_encode_orientedbox_info(proposals)
+    return _encode_box_info(proposals)
+
+
+class _OriginalRPCMPairwiseFeatureExtractor(nn.Module):
+    """Original RPCM PairwiseFeatureExtractor with dataset binding removed."""
+
+    def __init__(self, cfg: dict, in_channels: int):
+        super().__init__()
+        self.cfg = cfg
+        self.obj_classes = list(_cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "CLASS_NAMES", default=[]))
+        self.rel_classes = list(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RELATION_NAMES", default=[]))
+        self.num_obj_classes = int(_cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "NUM_CLASSES", default=len(self.obj_classes)))
+        self.num_rel_classes = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "NUM_CLASSES", default=len(self.rel_classes)))
+        if len(self.obj_classes) < self.num_obj_classes:
+            self.obj_classes += [f"class_{idx}" for idx in range(len(self.obj_classes), self.num_obj_classes)]
+        if len(self.rel_classes) < self.num_rel_classes:
+            self.rel_classes += [f"relation_{idx}" for idx in range(len(self.rel_classes), self.num_rel_classes)]
+
+        if bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "USE_GT_BOX", default=False)):
+            self.mode = "predcls" if bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "USE_GT_OBJECT_LABEL", default=False)) else "sgcls"
+        else:
+            self.mode = "sgdet"
+
+        self.embed_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "EMBED_DIM", default=200))
+        self.obj_dim = in_channels
+        self.hidden_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "CONTEXT_HIDDEN_DIM", default=in_channels))
+        self.pooling_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "CONTEXT_POOLING_DIM", default=in_channels))
+        self.rel_feature_type = str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "EDGE_FEATURES_REPRESENTATION", default="fusion"))
+        self.word_embed_feats_on = bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "WORD_EMBEDDING_FEATURES", default=True))
+
+        if self.word_embed_feats_on:
+            obj_embed_vecs, obj_embed_mask, _ = _build_semantic_prototypes(
+                self.obj_classes,
+                self.embed_dim,
+                str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")),
+                self.embed_dim,
+                "semantic",
+                modifier_aware=bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PROTO_TEXT_INIT_MODIFIER_AWARE", default=True)),
+            )
+            self.obj_embed_on_prob_dist = nn.Embedding(self.num_obj_classes, self.embed_dim)
+            self.obj_embed_on_pred_label = nn.Embedding(self.num_obj_classes, self.embed_dim)
+            with torch.no_grad():
+                self.obj_embed_on_prob_dist.weight.normal_(0, 1)
+                self.obj_embed_on_pred_label.weight.normal_(0, 1)
+                if obj_embed_mask.any():
+                    self.obj_embed_on_prob_dist.weight[obj_embed_mask[: self.num_obj_classes]] = obj_embed_vecs[: self.num_obj_classes][obj_embed_mask[: self.num_obj_classes]]
+                    self.obj_embed_on_pred_label.weight[obj_embed_mask[: self.num_obj_classes]] = obj_embed_vecs[: self.num_obj_classes][obj_embed_mask[: self.num_obj_classes]]
+        else:
+            self.embed_dim = 0
+
+        self.rel_feat_dim_not_match = self.pooling_dim != in_channels
+        if self.rel_feat_dim_not_match:
+            self.rel_feature_up_dim = _orig_make_fc(in_channels, self.pooling_dim)
+        self.pairwise_obj_feat_updim_fc = _orig_make_fc(
+            self.hidden_dim + self.obj_dim + self.embed_dim,
+            self.hidden_dim * 2,
+        )
+        if self.rel_feature_type in ["obj_pair", "fusion"]:
+            self.spatial_for_vision = bool(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "CAUSAL", "SPATIAL_FOR_VISION", default=True)
+            )
+            if self.spatial_for_vision:
+                self.spt_emb = nn.Sequential(
+                    _orig_make_fc(32, self.hidden_dim),
+                    nn.ReLU(inplace=True),
+                    _orig_make_fc(self.hidden_dim, self.hidden_dim * 2),
+                    nn.ReLU(inplace=True),
+                )
+            self.pairwise_rel_feat_finalize_fc = nn.Sequential(
+                _orig_make_fc(self.hidden_dim * 2, self.pooling_dim),
+                nn.ReLU(inplace=True),
+            )
+
+        self.geometry_feat_dim = 128
+        self.pos_embed = nn.Sequential(
+            _orig_make_fc(9, 32),
+            nn.BatchNorm1d(32, momentum=0.001),
+            _orig_make_fc(32, self.geometry_feat_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.obj_hidden_linear = _orig_make_fc(
+            self.obj_dim + self.embed_dim + self.geometry_feat_dim,
+            self.hidden_dim,
+        )
+        self.obj_feat_aug_finalize_fc = nn.Sequential(
+            _orig_make_fc(self.hidden_dim + self.obj_dim + self.embed_dim, self.pooling_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def pairwise_rel_features(self, augment_obj_feat, union_features, rel_pair_idxs, inst_proposals):
+        get_box_info_fn = _orig_get_box_info_or if inst_proposals and inst_proposals[0].mode == "xywha" else _orig_get_box_info
+        obj_boxes = [get_box_info_fn(proposal.bbox, need_norm=True, proposal=proposal) for proposal in inst_proposals]
+        num_objs = [len(p) for p in inst_proposals]
+        fused = self.pairwise_obj_feat_updim_fc(augment_obj_feat).view(-1, 2, self.hidden_dim)
+        head_reps, tail_reps = fused[:, 0], fused[:, 1]
+        head_split = head_reps.split(num_objs, dim=0)
+        tail_split = tail_reps.split(num_objs, dim=0)
+
+        obj_pair_feat = []
+        pair_bbox_info = []
+        for pair_idx, head, tail, obj_box in zip(rel_pair_idxs, head_split, tail_split, obj_boxes):
+            if pair_idx.numel() == 0:
+                continue
+            obj_pair_feat.append(torch.cat((head[pair_idx[:, 0]], tail[pair_idx[:, 1]]), dim=-1))
+            pair_bbox_info.append(_orig_get_box_pair_info(obj_box[pair_idx[:, 0]], obj_box[pair_idx[:, 1]]))
+        if not obj_pair_feat:
+            return augment_obj_feat.new_zeros((0, self.pooling_dim))
+        obj_pair_feat = torch.cat(obj_pair_feat, dim=0)
+        pair_bbox_geo_info = torch.cat(pair_bbox_info, dim=0)
+        if getattr(self, "spatial_for_vision", False):
+            obj_pair_feat = obj_pair_feat * self.spt_emb(pair_bbox_geo_info)
+        return self.pairwise_rel_feat_finalize_fc(obj_pair_feat)
+
+    def forward(self, inst_roi_feats, union_features, inst_proposals, rel_pair_idxs):
+        obj_labels = (
+            torch.cat([p.get_field("labels") for p in inst_proposals], dim=0)
+            if (self.training or bool(_cfg_get(self.cfg, "MODEL", "ROI_RELATION_HEAD", "USE_GT_BOX", default=False)))
+            else None
+        )
+        if self.word_embed_feats_on:
+            if bool(_cfg_get(self.cfg, "MODEL", "ROI_RELATION_HEAD", "USE_GT_OBJECT_LABEL", default=False)):
+                obj_embed_by_pred_dist = self.obj_embed_on_prob_dist(obj_labels.long().clamp(min=0, max=self.num_obj_classes - 1))
+            else:
+                obj_logits = torch.cat([p.get_field("predict_logits") for p in inst_proposals], dim=0).detach()
+                obj_embed_by_pred_dist = F.softmax(obj_logits[:, : self.num_obj_classes], dim=1) @ self.obj_embed_on_prob_dist.weight
+        else:
+            obj_embed_by_pred_dist = inst_roi_feats.new_zeros((inst_roi_feats.size(0), 0))
+
+        pos_embed = self.pos_embed(_orig_encode_box_info(inst_proposals))
+        obj_pre_rep = torch.cat((inst_roi_feats, obj_embed_by_pred_dist, pos_embed), dim=-1)
+        augment_obj_feat = self.obj_hidden_linear(obj_pre_rep)
+
+        obj_pred_labels = (
+            torch.cat([p.get_field("pred_labels") for p in inst_proposals], dim=0)
+            if self.mode != "predcls"
+            else obj_labels
+        )
+        if self.word_embed_feats_on:
+            obj_embed_by_pred_labels = self.obj_embed_on_pred_label(obj_pred_labels.long().clamp(min=0, max=self.num_obj_classes - 1))
+            augment_obj_feat = torch.cat((obj_embed_by_pred_labels, inst_roi_feats, augment_obj_feat), dim=-1)
+        else:
+            augment_obj_feat = torch.cat((inst_roi_feats, augment_obj_feat), dim=-1)
+
+        if self.rel_feature_type in ["obj_pair", "fusion"]:
+            rel_features = self.pairwise_rel_features(augment_obj_feat, union_features, rel_pair_idxs, inst_proposals)
+            if self.rel_feature_type == "fusion":
+                if self.rel_feat_dim_not_match:
+                    union_features = self.rel_feature_up_dim(union_features)
+                rel_features = rel_features + union_features
+        elif self.rel_feature_type == "union":
+            rel_features = self.rel_feature_up_dim(union_features) if self.rel_feat_dim_not_match else union_features
+        else:
+            raise ValueError(f"Unknown rel_feature_type: {self.rel_feature_type}")
 
         augment_obj_feat = self.obj_feat_aug_finalize_fc(augment_obj_feat)
         return augment_obj_feat, rel_features
@@ -1546,6 +1809,729 @@ class RPCM(nn.Module):
         return relation_logits, refine_logits, dict(proto_losses)
 
 
+class _LegacyGCNLayer(nn.Module):
+    """Dense GCN layer matching the original RPCM AGCN implementation."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        activation=F.relu,
+        bias: bool = True,
+        residual: bool = True,
+        dropout: float = 0.1,
+        batch_norm: bool = False,
+    ):
+        super().__init__()
+        self.activation = activation
+        self.residual = bool(residual)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.weight = nn.Parameter(torch.empty(in_dim, out_dim))
+        self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
+        self.res_fc = nn.Linear(in_dim, out_dim, bias=False) if residual and in_dim != out_dim else None
+        self.bn = nn.BatchNorm1d(out_dim) if batch_norm else nn.Identity()
+        nn.init.xavier_uniform_(self.weight)
+
+    @staticmethod
+    def _normalize_adj(adj: torch.Tensor) -> torch.Tensor:
+        if adj.numel() == 0:
+            return adj
+        adj = adj + torch.eye(adj.size(0), device=adj.device, dtype=adj.dtype)
+        deg = adj.sum(1)
+        deg_inv_sqrt = torch.pow(deg, -0.5)
+        deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0
+        return deg_inv_sqrt.unsqueeze(1) * adj * deg_inv_sqrt.unsqueeze(0)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x.new_zeros((x.size(0), self.weight.size(1)))
+        x_in = self.dropout(x)
+        adj_norm = self._normalize_adj(adj.to(dtype=x_in.dtype))
+        support = torch.matmul(adj_norm, x_in)
+        out = torch.matmul(support, self.weight)
+        if self.bias is not None:
+            out = out + self.bias
+        out = self.bn(out)
+        if self.residual:
+            out = out + (self.res_fc(x_in) if self.res_fc is not None else x_in)
+        if self.activation is not None:
+            out = self.activation(out)
+        return out
+
+
+class _LegacyCollectionUnit(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int):
+        super().__init__()
+        self.fc = nn.Linear(dim_in, dim_out, bias=True)
+        _normal_init_linear(self.fc, mean=0.0, std=0.01)
+
+    def forward(self, target: torch.Tensor, source: torch.Tensor, attention_base: torch.Tensor) -> torch.Tensor:
+        del target
+        if source.numel() == 0 or attention_base.numel() == 0:
+            return source.new_zeros((attention_base.size(0), self.fc.out_features))
+        fc_out = F.relu(self.fc(source))
+        collect = torch.mm(attention_base.to(dtype=fc_out.dtype), fc_out)
+        return collect / (attention_base.sum(1, keepdim=True).to(dtype=fc_out.dtype) + 1e-7)
+
+
+class _LegacyGraphConvolutionLayerCollect(nn.Module):
+    def __init__(self, dim_obj: int, dim_rel: int):
+        super().__init__()
+        self.collect_units = nn.ModuleList(
+            [
+                _LegacyCollectionUnit(dim_obj, dim_rel),
+                _LegacyCollectionUnit(dim_obj, dim_rel),
+            ]
+        )
+
+    def forward(self, target: torch.Tensor, source: torch.Tensor, attention: torch.Tensor, unit_id: int) -> torch.Tensor:
+        return self.collect_units[int(unit_id)](target, source, attention)
+
+
+class _LegacyCABias(nn.Module):
+    """Original RPCM context-adaptive bias module."""
+
+    def __init__(
+        self,
+        num_obj: int,
+        num_rel: int,
+        obj_emb_dim: int = 200,
+        geom_hidden: int = 64,
+        mlp_hidden: int = 256,
+        dropout: float = 0.1,
+        use_gate: bool = True,
+        rel_hidden_dim: int = 2048,
+    ):
+        super().__init__()
+        self.num_obj = num_obj
+        self.num_rel = num_rel
+        self.obj_emb = nn.Embedding(num_obj, obj_emb_dim)
+        self.hbb_geom_mlp = nn.Sequential(
+            nn.Linear(6, geom_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(geom_hidden, geom_hidden),
+            nn.ReLU(inplace=True),
+        )
+        self.obb_geom_mlp = nn.Sequential(
+            nn.Linear(8, geom_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(geom_hidden, geom_hidden),
+            nn.ReLU(inplace=True),
+        )
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(obj_emb_dim * 2 + geom_hidden, mlp_hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, num_rel),
+        )
+        self.use_gate = use_gate
+        if self.use_gate:
+            self.gate = nn.Sequential(
+                nn.Linear(rel_hidden_dim, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, 1),
+            )
+        try:
+            from torchvision.ops import box_iou_rotated  # noqa: F401
+            self._has_torchvision_riou = True
+        except Exception:
+            self._has_torchvision_riou = False
+
+    def _obj_embed(self, labels_or_probs: torch.Tensor) -> torch.Tensor:
+        if labels_or_probs.dim() == 1:
+            return self.obj_emb(labels_or_probs.long().clamp(min=0, max=self.num_obj - 1))
+        probs = labels_or_probs
+        if probs.size(1) > self.num_obj:
+            probs = probs[:, : self.num_obj]
+        if probs.size(1) != self.num_obj:
+            probs = F.softmax(probs, dim=1)
+        return probs @ self.obj_emb.weight
+
+    @staticmethod
+    def _box_iou_xyxy(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        x1 = torch.maximum(a[:, 0], b[:, 0])
+        y1 = torch.maximum(a[:, 1], b[:, 1])
+        x2 = torch.minimum(a[:, 2], b[:, 2])
+        y2 = torch.minimum(a[:, 3], b[:, 3])
+        inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+        area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+        area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+        return inter / (area_a + area_b - inter + eps)
+
+    @staticmethod
+    def _wrap_angle_rad(angle: torch.Tensor) -> torch.Tensor:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _geom_hbb(self, subject_boxes: torch.Tensor, object_boxes: torch.Tensor) -> torch.Tensor:
+        csx = 0.5 * (subject_boxes[:, 0] + subject_boxes[:, 2])
+        csy = 0.5 * (subject_boxes[:, 1] + subject_boxes[:, 3])
+        cox = 0.5 * (object_boxes[:, 0] + object_boxes[:, 2])
+        coy = 0.5 * (object_boxes[:, 1] + object_boxes[:, 3])
+        ws = (subject_boxes[:, 2] - subject_boxes[:, 0]).clamp(min=1.0)
+        hs = (subject_boxes[:, 3] - subject_boxes[:, 1]).clamp(min=1.0)
+        wo = (object_boxes[:, 2] - object_boxes[:, 0]).clamp(min=1.0)
+        ho = (object_boxes[:, 3] - object_boxes[:, 1]).clamp(min=1.0)
+        dx = (csx - cox) / wo
+        dy = (csy - coy) / ho
+        log_wr = torch.log(ws / wo)
+        log_hr = torch.log(hs / ho)
+        iou = self._box_iou_xyxy(subject_boxes, object_boxes)
+        dist = torch.sqrt(dx * dx + dy * dy)
+        geom = torch.stack([dx, dy, log_wr, log_hr, iou, dist], dim=1)
+        return self.hbb_geom_mlp(geom)
+
+    def _geom_obb(self, subject_boxes: torch.Tensor, object_boxes: torch.Tensor) -> torch.Tensor:
+        xs, ys = subject_boxes[:, 0], subject_boxes[:, 1]
+        ws = subject_boxes[:, 2].clamp(min=1.0)
+        hs = subject_boxes[:, 3].clamp(min=1.0)
+        angle_s = subject_boxes[:, 4]
+        xo, yo = object_boxes[:, 0], object_boxes[:, 1]
+        wo = object_boxes[:, 2].clamp(min=1.0)
+        ho = object_boxes[:, 3].clamp(min=1.0)
+        angle_o = object_boxes[:, 4]
+
+        # Original CABias comments assume degree-valued OBB angles and convert
+        # with pi/180 here. Keep this exact behavior for checkpoint parity.
+        angle_s_rad = angle_s * math.pi / 180.0
+        angle_o_rad = angle_o * math.pi / 180.0
+        dtheta = self._wrap_angle_rad(angle_s_rad - angle_o_rad)
+        sin_dt = torch.sin(dtheta)
+        cos_dt = torch.cos(dtheta)
+
+        dx0 = (xs - xo) / wo
+        dy0 = (ys - yo) / ho
+        cos_o = torch.cos(-angle_o_rad)
+        sin_o = torch.sin(-angle_o_rad)
+        dx = cos_o * dx0 - sin_o * dy0
+        dy = sin_o * dx0 + cos_o * dy0
+        log_wr = torch.log(ws / wo)
+        log_hr = torch.log(hs / ho)
+        dist = torch.sqrt(dx * dx + dy * dy)
+        if self._has_torchvision_riou:
+            from torchvision.ops import box_iou_rotated
+
+            iou = box_iou_rotated(subject_boxes, object_boxes).diag()
+        else:
+            iou = torch.zeros_like(dist)
+        geom = torch.stack([dx, dy, log_wr, log_hr, sin_dt, cos_dt, iou, dist], dim=1)
+        return self.obb_geom_mlp(geom)
+
+    def forward(
+        self,
+        obj_labels_or_probs: torch.Tensor,
+        rel_inds: torch.Tensor,
+        boxes: torch.Tensor,
+        rel_hidden: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if rel_inds.numel() == 0:
+            return boxes.new_zeros((0, self.num_rel))
+        obj_emb = self._obj_embed(obj_labels_or_probs)
+        subj = rel_inds[:, 0].long()
+        obj = rel_inds[:, 1].long()
+        emb_subj = obj_emb[subj]
+        emb_obj = obj_emb[obj]
+        subj_boxes = boxes[subj]
+        obj_boxes = boxes[obj]
+        if boxes.size(1) == 4:
+            geom_feat = self._geom_hbb(subj_boxes, obj_boxes)
+        elif boxes.size(1) == 5:
+            geom_feat = self._geom_obb(subj_boxes, obj_boxes)
+        else:
+            raise ValueError(f"Unsupported box dim for CABias: {boxes.size(1)}")
+        bias_logits = self.bias_mlp(torch.cat([emb_subj, emb_obj, geom_feat], dim=1))
+        if self.use_gate and rel_hidden is not None:
+            bias_logits = bias_logits * torch.sigmoid(self.gate(rel_hidden))
+        return bias_logits
+
+
+class LegacyPredicatePrototypeHead(nn.Module):
+    """Original RPCM-style predicate prototype head.
+
+    Later RPCM checkpoints in this workspace use a K-prototype tensor
+    ``[num_rel, K, glove_dim]`` plus optional visual EMA buffers.  The older
+    ``6850_4135.pth`` checkpoint used a single 2D prototype tensor
+    ``[num_rel, glove_dim]`` and did not register visual-prototype buffers.  The
+    ``checkpoint_compat_2d`` flag keeps that older state_dict layout exactly so
+    the legacy predictor can share parameters strictly with both variants.
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        d: int,
+        glove_init: torch.Tensor,
+        tau: float = 16.0,
+        use_proj: bool = True,
+        use_bn: bool = True,
+        ema_alpha: float | None = 0.9,
+        lambda_pull: float = 0.2,
+        lambda_sep: float = 0.01,
+        sep_type: str = "etf",
+        gamma: float = 10.0,
+        num_proto_per_cls: int = 2,
+        proto_agg: str = "lse",
+        lse_beta: float = 10.0,
+        use_vis_proto: bool = True,
+        vis_momentum: float = 0.9,
+        alpha_fuse: float = 0.7,
+        checkpoint_compat_2d: bool = False,
+    ):
+        super().__init__()
+        self.d = int(d)
+        self.tau = nn.Parameter(torch.tensor(float(tau)), requires_grad=True)
+        self.num_proto_per_cls = int(num_proto_per_cls)
+        self.checkpoint_compat_2d = bool(checkpoint_compat_2d)
+        if self.checkpoint_compat_2d and self.num_proto_per_cls != 1:
+            raise ValueError("2D legacy prototype compatibility requires num_proto_per_cls == 1")
+        self.proto_agg = str(proto_agg)
+        self.lse_beta = float(lse_beta)
+        self.use_vis_proto = bool(use_vis_proto)
+        if self.checkpoint_compat_2d and self.use_vis_proto:
+            raise ValueError("2D legacy prototype compatibility does not register visual prototype buffers")
+        self.vis_momentum = float(vis_momentum)
+        self.alpha_fuse = float(alpha_fuse)
+        self.ema_alpha = ema_alpha
+        self.lambda_pull = float(lambda_pull)
+        self.lambda_sep = float(lambda_sep)
+        self.sep_type = str(sep_type)
+        self.gamma = float(gamma)
+
+        if use_proj:
+            layers: list[nn.Module] = [nn.Linear(d_in, d, bias=False)]
+            if use_bn:
+                layers.append(nn.BatchNorm1d(d))
+            layers.extend([nn.ReLU(inplace=True), nn.Linear(d, d, bias=False)])
+            self.proj = nn.Sequential(*layers)
+        else:
+            if d_in != d:
+                raise ValueError("Legacy prototype head without projection requires d_in == d")
+            self.proj = nn.Identity()
+
+        num_classes, glove_dim = glove_init.shape
+        if self.checkpoint_compat_2d:
+            base = glove_init.contiguous()
+        else:
+            base = glove_init.unsqueeze(1).repeat(1, self.num_proto_per_cls, 1).contiguous()
+        base = base + 0.01 * torch.randn_like(base)
+        self.base_prototypes = nn.Parameter(base)
+        self.mapper = nn.Linear(glove_dim, d, bias=False)
+        nn.init.orthogonal_(self.mapper.weight)
+
+        if ema_alpha is not None:
+            with torch.no_grad():
+                mapped = self.mapper(self.base_prototypes)
+                p_init = l2n(mapped, dim=1 if self.checkpoint_compat_2d else 2)
+                self.register_buffer("proto_ema", p_init.clone())
+        if self.use_vis_proto:
+            self.register_buffer("proto_vis", torch.zeros(num_classes, self.num_proto_per_cls, d))
+            self.register_buffer("proto_vis_inited", torch.zeros(num_classes, self.num_proto_per_cls, dtype=torch.bool))
+
+    def _current_glove_prototypes(self) -> torch.Tensor:
+        proto = l2n(self.mapper(self.base_prototypes), dim=1 if self.checkpoint_compat_2d else 2)
+        if self.ema_alpha is None or not hasattr(self, "proto_ema"):
+            return proto
+        return l2n(
+            self.ema_alpha * proto + (1.0 - self.ema_alpha) * self.proto_ema,
+            dim=1 if self.checkpoint_compat_2d else 2,
+        )
+
+    def _fuse_prototypes(self, proto_glove: torch.Tensor) -> torch.Tensor:
+        if not self.use_vis_proto:
+            return proto_glove
+        proto_vis = l2n(self.proto_vis, dim=2)
+        mask = self.proto_vis_inited.float().unsqueeze(-1)
+        proto_vis = mask * proto_vis + (1.0 - mask) * proto_glove
+        return l2n(self.alpha_fuse * proto_glove + (1.0 - self.alpha_fuse) * proto_vis, dim=2)
+
+    @torch.no_grad()
+    def update_glove_ema(self):
+        if self.ema_alpha is None or not hasattr(self, "proto_ema"):
+            return
+        proto = l2n(
+            self.mapper(self.base_prototypes).detach(),
+            dim=1 if self.checkpoint_compat_2d else 2,
+        )
+        self.proto_ema.copy_(
+            l2n(
+                self.ema_alpha * proto + (1.0 - self.ema_alpha) * self.proto_ema,
+                dim=1 if self.checkpoint_compat_2d else 2,
+            )
+        )
+
+    @torch.no_grad()
+    def update_vis_proto(self, z: torch.Tensor, y: torch.Tensor, proto_ref: torch.Tensor):
+        if not self.use_vis_proto or y is None or y.numel() == 0:
+            return
+        num_classes, num_proto, _ = proto_ref.shape
+        valid = (y >= 0) & (y < num_classes)
+        if not valid.any():
+            return
+        z = z[valid]
+        y = y[valid]
+        for c_tensor in y.unique():
+            c = int(c_tensor.item())
+            zc = z[y == c]
+            if zc.numel() == 0:
+                continue
+            assignment = (zc @ proto_ref[c].t()).argmax(dim=1)
+            for k in range(num_proto):
+                zk = zc[assignment == k]
+                if zk.numel() == 0:
+                    continue
+                mean_z = l2n(zk.mean(dim=0), dim=0)
+                if not bool(self.proto_vis_inited[c, k]):
+                    self.proto_vis[c, k] = mean_z
+                    self.proto_vis_inited[c, k] = True
+                else:
+                    self.proto_vis[c, k] = l2n(
+                        self.vis_momentum * self.proto_vis[c, k] + (1.0 - self.vis_momentum) * mean_z,
+                        dim=0,
+                    )
+
+    def _aggregate_logits(self, sim: torch.Tensor) -> torch.Tensor:
+        if self.proto_agg == "max":
+            cls_sim = sim.max(dim=2).values
+        else:
+            cls_sim = torch.logsumexp(self.lse_beta * sim, dim=2) / self.lse_beta
+        return self.tau * cls_sim
+
+    def forward(self, feats: torch.Tensor, labels: torch.Tensor | None = None):
+        if feats.numel() == 0:
+            return feats.new_zeros((0, self.base_prototypes.size(0))), {}
+        z = l2n(self.proj(feats), dim=1)
+        proto_glove = self._current_glove_prototypes()
+        proto = self._fuse_prototypes(proto_glove)
+        if self.checkpoint_compat_2d:
+            sim = z @ proto.t()
+            logits = self.tau * sim
+        else:
+            sim = torch.einsum("nd,ckd->nck", z, proto)
+            logits = self._aggregate_logits(sim)
+        losses: dict[str, torch.Tensor] = {}
+        if not self.training:
+            return logits, losses
+
+        self.update_glove_ema()
+        if labels is not None and labels.numel() > 0:
+            valid = (labels >= 0) & (labels < proto.size(0))
+            if valid.any():
+                valid_labels = labels[valid].long()
+                valid_z = z[valid]
+                self.update_vis_proto(valid_z.detach(), valid_labels.detach(), proto.detach())
+                if self.checkpoint_compat_2d:
+                    proto_y = proto[valid_labels]
+                else:
+                    sim_y = sim[valid][torch.arange(valid_z.size(0), device=feats.device), valid_labels]
+                    best_k = sim_y.argmax(dim=1)
+                    proto_y = proto[valid_labels, best_k]
+                losses["pull"] = self.lambda_pull * (1.0 - (valid_z * proto_y).sum(dim=1)).mean()
+            else:
+                losses["pull"] = z.sum() * 0.0
+
+        proto_mean = l2n(proto, dim=1) if self.checkpoint_compat_2d else l2n(proto.mean(dim=1), dim=1)
+        if self.sep_type.lower() == "etf" and proto_mean.size(0) > 1:
+            target = -1.0 / (proto_mean.size(0) - 1)
+            gram = proto_mean @ proto_mean.t()
+            mask = ~torch.eye(proto_mean.size(0), dtype=torch.bool, device=proto_mean.device)
+            loss_sep = ((gram[mask] - target) ** 2).mean()
+        else:
+            gram = proto_mean @ proto_mean.t()
+            mask = ~torch.eye(proto_mean.size(0), dtype=torch.bool, device=proto_mean.device)
+            loss_sep = torch.exp(self.gamma * gram[mask]).mean() if mask.any() else proto_mean.sum() * 0.0
+        losses["sep"] = self.lambda_sep * loss_sep
+        return logits, losses
+
+
+class RPCMLegacy(nn.Module):
+    """Closest in-project port of the original RPCM predictor.
+
+    It keeps the current project's BoxList/feature-extractor interfaces, but
+    restores the original dense object-relation graph propagation and
+    multi-prototype relation classifier.
+    """
+
+    def __init__(self, cfg: dict, in_channels: int):
+        super().__init__()
+        self.cfg = cfg
+        self.in_channels = in_channels
+        self.num_obj_classes = int(cfg["MODEL"]["ROI_BOX_HEAD"]["NUM_CLASSES"])
+        self.num_rel_classes = int(cfg["MODEL"]["ROI_RELATION_HEAD"]["NUM_CLASSES"])
+        self.pooling_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "CONTEXT_POOLING_DIM", default=in_channels))
+        self.mlp_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_MLP_DIM", default=2048))
+        self.graph_dim = self.pooling_dim
+        self.feat_update_step = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_FEAT_UPDATE_STEP", default=2))
+        dropout = float(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_DROPOUT", default=0.2))
+        self.predict_use_bias = bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICT_USE_BIAS", default=False))
+        self.bias_lambda_train = float(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_BIAS_LAMBDA_TRAIN", default=0.4)
+        )
+        self.bias_lambda_test = float(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_BIAS_LAMBDA_TEST", default=0.5)
+        )
+
+        self.post_emb = nn.Linear(in_channels, self.mlp_dim * 2)
+        self.pairwise_feature_extractor = PairwiseFeatureExtractor(cfg, in_channels)
+        self.rel_residual = nn.Sequential(
+            nn.Linear(self.mlp_dim, self.mlp_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.rel_norm = nn.LayerNorm(self.mlp_dim)
+        self.down_samp = MLP(self.pooling_dim, self.mlp_dim, self.mlp_dim, 2)
+
+        self.gcn_ent2ent = nn.ModuleList()
+        self.gcn_ent2rel = nn.ModuleList()
+        self.gcn_rel2rel = nn.ModuleList()
+        for _ in range(self.feat_update_step):
+            self.gcn_ent2ent.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
+            self.gcn_ent2rel.append(_LegacyGraphConvolutionLayerCollect(self.graph_dim, self.graph_dim))
+            self.gcn_rel2rel.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
+
+        proto_embed_dim = int(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_PROTO_EMBED_DIM",
+                default=0,
+            )
+        )
+        if proto_embed_dim <= 0:
+            proto_embed_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "EMBED_DIM", default=300))
+        self.pos_embed = nn.Sequential(
+            nn.Linear(9, 32),
+            nn.BatchNorm1d(32, momentum=0.001),
+            nn.Linear(32, 128),
+            nn.ReLU(inplace=True),
+        )
+        self.obj_embed1 = nn.Embedding(self.num_obj_classes, proto_embed_dim)
+        self.lin_obj_cyx = nn.Linear(in_channels + proto_embed_dim + 128, 512)
+        if bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_LEGACY_REGISTER_BIAS_MODULE",
+                default=True,
+            )
+        ):
+            self.bias_module = _LegacyCABias(
+                num_obj=self.num_obj_classes,
+                num_rel=self.num_rel_classes,
+                obj_emb_dim=200,
+                geom_hidden=64,
+                mlp_hidden=256,
+                rel_hidden_dim=self.mlp_dim,
+            )
+
+        self.relation_names = list(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RELATION_NAMES", default=[]))
+        if len(self.relation_names) < self.num_rel_classes:
+            self.relation_names = self.relation_names + [
+                f"relation_{idx}" for idx in range(len(self.relation_names), self.num_rel_classes)
+            ]
+        semantic_glove_path = str(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_PROTO_GLOVE_PATH",
+                default="",
+            )
+            or _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")
+        )
+        rel_glove_init, rel_text_diag = _build_prototype_text_init(
+            self.relation_names,
+            semantic_glove_path,
+            proto_embed_dim,
+            str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_PROTO_INIT", default="semantic")),
+            modifier_aware=bool(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PROTO_TEXT_INIT_MODIFIER_AWARE", default=True)
+            ),
+        )
+        self.rel_proto = LegacyPredicatePrototypeHead(
+            d_in=self.mlp_dim,
+            d=self.mlp_dim,
+            glove_init=rel_glove_init,
+            ema_alpha=float(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_PROTO_MOMENTUM", default=0.9)),
+            num_proto_per_cls=int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_NUM_PROTO", default=2)),
+            proto_agg=str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_PROTO_AGG", default="lse")),
+            lse_beta=float(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_LSE_BETA", default=10.0)),
+            use_vis_proto=bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_USE_VIS_PROTO", default=True)),
+            vis_momentum=float(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_VIS_MOMENTUM", default=0.9)),
+            alpha_fuse=float(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_ALPHA_FUSE", default=0.7)),
+            checkpoint_compat_2d=bool(
+                _cfg_get(
+                    cfg,
+                    "MODEL",
+                    "ROI_RELATION_HEAD",
+                    "RPCM_LEGACY_PROTO_2D_COMPAT",
+                    default=False,
+                )
+            ),
+        )
+        print(
+            "[RPCM_LEGACY] "
+            f"graph_dim={self.graph_dim}, mlp_dim={self.mlp_dim}, feat_update_step={self.feat_update_step}, "
+            f"glove_missing={rel_text_diag.get('missing_predicates', [])}",
+            flush=True,
+        )
+
+    def _get_map_idxs(self, proposals: Sequence, proposal_pairs: Sequence[torch.Tensor]):
+        obj_num = sum(len(p) for p in proposals)
+        if obj_num == 0 or not proposal_pairs:
+            device = proposals[0].bbox.device if proposals else torch.device("cpu")
+            return (
+                torch.zeros((obj_num, 0), device=device),
+                torch.zeros((obj_num, 0), device=device),
+                torch.zeros((0, 0), device=device),
+                torch.zeros((0, 0), device=device),
+                torch.zeros((obj_num, obj_num), device=device),
+            )
+        rel_inds = []
+        offset = 0
+        for proposal, pair_idx in zip(proposals, proposal_pairs):
+            if pair_idx.numel() > 0:
+                rel_inds.append(pair_idx.to(dtype=torch.long) + offset)
+            offset += len(proposal)
+        if not rel_inds:
+            device = proposals[0].bbox.device
+            return (
+                torch.zeros((obj_num, 0), device=device),
+                torch.zeros((obj_num, 0), device=device),
+                torch.zeros((0, 0), device=device),
+                torch.zeros((0, 0), device=device),
+                torch.zeros((obj_num, obj_num), device=device),
+            )
+        rel_inds = torch.cat(rel_inds, dim=0)
+        device = rel_inds.device
+        dtype = torch.float32
+        num_rels = rel_inds.size(0)
+        subj_pred_map = torch.zeros((obj_num, num_rels), dtype=dtype, device=device)
+        obj_pred_map = torch.zeros((obj_num, num_rels), dtype=dtype, device=device)
+        arange_rel = torch.arange(num_rels, device=device)
+        subj_pred_map[rel_inds[:, 0], arange_rel] = 1.0
+        obj_pred_map[rel_inds[:, 1], arange_rel] = 1.0
+
+        pred_pred_subj = (subj_pred_map.t() @ subj_pred_map) > 0
+        pred_pred_obj = (obj_pred_map.t() @ obj_pred_map) > 0
+        pred_pred_subj.fill_diagonal_(False)
+        pred_pred_obj.fill_diagonal_(False)
+
+        cross = (obj_pred_map @ subj_pred_map.t()) > 0
+        entity_map = cross | cross.t()
+        entity_map.fill_diagonal_(False)
+        return (
+            subj_pred_map,
+            obj_pred_map,
+            pred_pred_subj.to(dtype=dtype),
+            pred_pred_obj.to(dtype=dtype),
+            entity_map.to(dtype=dtype),
+        )
+
+    def _refine_logits(self, proposals: Sequence, device: torch.device) -> list[torch.Tensor]:
+        logits = []
+        for proposal in proposals:
+            if proposal.has_field("predict_logits"):
+                logits.append(proposal.get_field("predict_logits"))
+                continue
+            labels = proposal.get_field("labels").long().clamp(min=0, max=self.num_obj_classes - 1)
+            logits.append(F.one_hot(labels, num_classes=self.num_obj_classes).float().to(device))
+        return logits
+
+    def forward(
+        self,
+        proposals,
+        rel_pair_idxs,
+        rel_labels,
+        rel_binarys,
+        roi_features,
+        union_features,
+        logger=None,
+    ):
+        del rel_binarys, logger
+        augment_obj_feat, rel_feats = self.pairwise_feature_extractor(
+            roi_features,
+            union_features,
+            proposals,
+            rel_pair_idxs,
+        )
+        subj_pred_map, obj_pred_map, pred_pred_subj, pred_pred_obj, entity_map = self._get_map_idxs(
+            proposals,
+            [pair_idx.clone() for pair_idx in rel_pair_idxs],
+        )
+
+        obj_feats = [augment_obj_feat]
+        pred_feats = [rel_feats]
+        for t in range(self.feat_update_step):
+            obj_feats.append(self.gcn_ent2ent[t](obj_feats[t], entity_map))
+            if pred_feats[t].numel() == 0:
+                pred_feats.append(pred_feats[t])
+                continue
+            source_sub_rel = self.gcn_ent2rel[t](pred_feats[t], obj_feats[t], subj_pred_map.t(), 0)
+            source_obj_rel = self.gcn_ent2rel[t](pred_feats[t], obj_feats[t], obj_pred_map.t(), 1)
+            source_pred_sub = self.gcn_rel2rel[t](pred_feats[t], pred_pred_subj)
+            source_pred_obj = self.gcn_rel2rel[t](pred_feats[t], pred_pred_obj)
+            pred_feats.append((source_sub_rel + source_obj_rel + source_pred_sub + source_pred_obj) / 4.0)
+
+        rel_features = torch.stack(pred_feats, dim=0).mean(dim=0) if pred_feats else rel_feats
+        rel_hidden = self.down_samp(rel_features)
+        rel_hidden = self.rel_norm(self.rel_residual(rel_hidden) + rel_hidden)
+
+        flat_rel_labels = None
+        if self.training and rel_labels is not None and rel_labels:
+            flat_rel_labels = torch.cat(rel_labels, dim=0)
+        relation_logits, proto_losses = self.rel_proto(rel_hidden, flat_rel_labels)
+
+        if self.predict_use_bias and hasattr(self, "bias_module") and rel_hidden.numel() > 0:
+            rel_inds = []
+            offset = 0
+            for proposal, pair_idx in zip(proposals, rel_pair_idxs):
+                if pair_idx.numel() > 0:
+                    rel_inds.append(pair_idx.to(dtype=torch.long, device=rel_hidden.device) + offset)
+                offset += len(proposal)
+            if rel_inds:
+                rel_inds = torch.cat(rel_inds, dim=0)
+                boxes = torch.cat([proposal.bbox.to(rel_hidden.device) for proposal in proposals], dim=0)
+                if self.training and bool(
+                    _cfg_get(self.cfg, "MODEL", "ROI_RELATION_HEAD", "USE_GT_OBJECT_LABEL", default=False)
+                ):
+                    obj_in = torch.cat(
+                        [proposal.get_field("labels").long().to(rel_hidden.device) for proposal in proposals],
+                        dim=0,
+                    )
+                else:
+                    obj_logits = torch.cat(
+                        [proposal.get_field("predict_logits").to(rel_hidden.device) for proposal in proposals],
+                        dim=0,
+                    ).detach()
+                    obj_in = F.softmax(obj_logits, dim=1)
+                bias_logits = self.bias_module(obj_in, rel_inds, boxes, rel_hidden=rel_hidden)
+                bias_lambda = self.bias_lambda_train if self.training else self.bias_lambda_test
+                relation_logits = relation_logits + bias_lambda * bias_logits
+
+        num_rels = [pair_idx.size(0) for pair_idx in rel_pair_idxs]
+        relation_logits = list(relation_logits.split(num_rels, dim=0)) if num_rels else []
+        refine_logits = self._refine_logits(proposals, rel_hidden.device)
+        return relation_logits, refine_logits, dict(proto_losses)
+
+
+class RPCMOriginalLegacy(RPCMLegacy):
+    """Isolated original-RPCM predictor path.
+
+    This keeps the original RPCM internal PairwiseFeatureExtractor geometry
+    and module layout, while replacing the original repository's hard dataset
+    binding with class/relation names supplied by the current dataloader.
+    """
+
+    def __init__(self, cfg: dict, in_channels: int):
+        super().__init__(cfg, in_channels)
+        self.pairwise_feature_extractor = _OriginalRPCMPairwiseFeatureExtractor(cfg, in_channels)
+        print(
+            "[RPCM_ORIGINAL_LEGACY] using original PairwiseFeatureExtractor and radian OBB geometry",
+            flush=True,
+        )
+
+
 class QueryHierarchyRelationPredictor(nn.Module):
     def __init__(self, cfg: dict, in_channels: int):
         super().__init__()
@@ -1996,6 +2982,10 @@ def make_roi_relation_predictor(cfg: dict, in_channels: int):
         return TypedHyperRPCM(cfg, in_channels)
     if predictor_name in {"HIER_SUBGRAPH", "QUERY_HIERARCHY", "QHSG"}:
         return QueryHierarchyRelationPredictor(cfg, in_channels)
+    if predictor_name in {"RPCM_ORIGINAL_LEGACY", "ORIGINAL_RPCM_LEGACY", "RPCM_NATIVE_LEGACY"}:
+        return RPCMOriginalLegacy(cfg, in_channels)
+    if predictor_name in {"RPCM_LEGACY", "LEGACY_RPCM"}:
+        return RPCMLegacy(cfg, in_channels)
     if predictor_name == "RPCM":
         return RPCM(cfg, in_channels)
     else:

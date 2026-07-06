@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from sgg.data.collate import pad_images
 from sgg.modeling.anchor_generator.anchor_generator import AnchorGenerator
 from sgg.modeling.box_coder.box_coder import UnifiedBoxCoder
+from sgg.modeling.core.obb_ops import normalize_angle_unit, set_boxlist_angle_unit
 from sgg.modeling.matcher.matcher import Matcher
 from sgg.modeling.layers.nms import batched_nms
 from sgg.modeling.backbone.swin import SwinTransformer
@@ -50,11 +51,13 @@ class SceneGraphDetector(nn.Module):
 
         self.task = model_cfg["TASK"]
         self.box_mode = model_cfg["BOX_MODE"]
+        self.obb_angle_unit = normalize_angle_unit(model_cfg.get("OBB_ANGLE_UNIT", "degree"))
         self.num_classes = int(model_cfg["NUM_CLASSES"])
         self.num_predicates = int(model_cfg["NUM_PREDICATES"])
         self.hidden_dim = int(rel_cfg["NODE_DIM"])
         self.box_dim = 4 if self.box_mode == "hbb" else 5
         self.use_combined_roi_heads = bool(model_cfg.get("USE_COMBINED_ROI_HEADS", True))
+        self.store_detector_d2 = bool(model_cfg.get("STORE_DETECTOR_D2", False))
         self.backbone_name = model_cfg.get("BACKBONE", {}).get("NAME", "simple_cnn")
         self.neck_name = model_cfg.get("NECK", {}).get("NAME", "")
 
@@ -106,16 +109,7 @@ class SceneGraphDetector(nn.Module):
         )
         self.rpn_num_anchors = self.anchor_generator.num_anchors_per_location()[0]
         rpn_cfg = model_cfg.get("RPN_HEAD", {})
-        self.rpn_head = None
-        if rpn_cfg.get("NAME", "") == "oriented_rpn_head":
-            self.rpn_head = RotatedRPNHead(
-                in_channels=int(rpn_cfg.get("IN_CHANNELS", self.feature_channels)),
-                feat_channels=int(rpn_cfg.get("FEAT_CHANNELS", self.feature_channels)),
-                num_anchors=int(rpn_cfg.get("NUM_ANCHORS", 3)),
-                cls_out_channels=int(rpn_cfg.get("CLS_OUT_CHANNELS", 1)),
-                version=rpn_cfg.get("VERSION", "le90"),
-                use_sigmoid_cls=bool(rpn_cfg.get("USE_SIGMOID_CLS", True)),
-            )
+        self.rpn_head = self._build_standalone_rpn_head(rpn_cfg, self.feature_channels)
         self.manual_rpn = self.rpn_head is None
         self.det_tower = nn.Sequential(
             nn.Conv2d(self.feature_channels, self.hidden_dim, kernel_size=3, padding=1),
@@ -137,6 +131,25 @@ class SceneGraphDetector(nn.Module):
         self.obb_fallback_to_hbb = bool(proposal_cfg.get("OBB_FALLBACK_TO_HBB", True))
         self.roi_heads = build_roi_heads(cfg, self.feature_channels) if self.use_combined_roi_heads else None
         self.roi_head = self._build_standalone_roi_head(model_cfg, self.feature_channels)
+
+        # Original RPCM/mmrotate detector checkpoints contain a second detector
+        # branch named backbone_d2/neck_d2/rpn_head_d2/roi_head_d2.  PredCls in
+        # this project does not need to execute that branch, but keeping the
+        # modules lets us load and save the complete detector state dict for
+        # faithful checkpoint compatibility.
+        if self.store_detector_d2:
+            self.backbone_d2, backbone_d2_channels, _ = self._build_backbone(model_cfg.get("BACKBONE", {}))
+            self.neck_d2, neck_d2_channels = self._build_neck(model_cfg.get("NECK", {}), backbone_d2_channels)
+            self.feature_channels_d2 = neck_d2_channels if self.neck_d2 is not None else backbone_d2_channels[-1]
+            self.rpn_head_d2 = self._build_standalone_rpn_head(rpn_cfg, self.feature_channels_d2)
+            self.roi_head_d2 = self._build_standalone_roi_head(model_cfg, self.feature_channels_d2)
+        else:
+            self.backbone_d2 = None
+            self.neck_d2 = None
+            self.rpn_head_d2 = None
+            self.roi_head_d2 = None
+            self.feature_channels_d2 = None
+
         pretrained = model_cfg.get("PRETRAINED_DETECTOR", "")
         if pretrained:
             self.load_detector_pretrained(pretrained)
@@ -180,7 +193,36 @@ class SceneGraphDetector(nn.Module):
             raise RuntimeError("roi_head is not initialized.")
         return self.roi_head.bbox_roi_extractor(features, proposals)
 
-    def bbox_head(self, roi_feats: torch.Tensor) -> torch.Tensor:
+    def bbox_head(self, roi_feats: torch.Tensor, flag: bool = True):
+        if self.roi_head is None:
+            raise RuntimeError("roi_head is not initialized.")
+        if flag:
+            return self._forward_bbox_features(roi_feats)
+        return self.roi_head.bbox_head(roi_feats)
+
+    def _bbox_forward(self, features, rois, flag: bool = True):
+        """Compatibility path for the original RPCM/mmrotate detector API.
+
+        The original relation head calls ``OBj._bbox_forward(x, rois, flag=True)``
+        to get pooled bbox-head features for union boxes.  In this project the
+        relation code usually calls ``bbox_roi_extractor`` and ``bbox_head``
+        separately; this method restores the original combined path without
+        changing existing callers.
+        """
+        if self.roi_head is None:
+            raise RuntimeError("roi_head is not initialized.")
+        roi_feats = self.roi_head.bbox_roi_extractor(features, rois)
+        if flag:
+            return self._forward_bbox_features(roi_feats)
+        cls_score, bbox_pred = self.roi_head.bbox_head(roi_feats)
+        return {"bbox_feats": self._forward_bbox_features(roi_feats), "cls_score": cls_score, "bbox_pred": bbox_pred}
+
+    def bbox_logits(self, roi_feats: torch.Tensor):
+        if self.roi_head is None:
+            raise RuntimeError("roi_head is not initialized.")
+        return self.roi_head.bbox_head(roi_feats)
+
+    def bbox_features(self, roi_feats: torch.Tensor) -> torch.Tensor:
         if self.roi_head is None:
             raise RuntimeError("roi_head is not initialized.")
         return self._forward_bbox_features(roi_feats)
@@ -430,7 +472,7 @@ class SceneGraphDetector(nn.Module):
             return empty_logits, empty_bbox
 
         bbox_feats = self.bbox_roi_extractor(features, list(proposals))
-        cls_score, bbox_pred = self.roi_head.bbox_head(bbox_feats)
+        cls_score, bbox_pred = self.bbox_logits(bbox_feats)
         splits = [len(p) for p in proposals]
         cls_chunks = list(cls_score.split(splits, dim=0))
         bbox_chunks = list(bbox_pred.split(splits, dim=0)) if bbox_pred is not None else [
@@ -622,6 +664,7 @@ class SceneGraphDetector(nn.Module):
         for proposal, boxes, labels in zip(proposals, det_bboxes, det_labels):
             box_tensor = boxes[:, :5] if boxes.numel() > 0 else proposal.bbox.new_zeros((0, 5))
             result = BoxList(box_tensor, proposal.size, "xywha")
+            set_boxlist_angle_unit(result, self.obb_angle_unit)
             pred_labels = labels + 1 if labels.numel() > 0 else labels
             pred_scores = boxes[:, 5] if boxes.numel() > 0 else proposal.bbox.new_zeros((0,))
             predict_logits = proposal.bbox.new_zeros((len(result), self.num_classes))
@@ -879,6 +922,8 @@ class SceneGraphDetector(nn.Module):
         if boxes.numel() == 0:
             img_h, img_w = image_size
             proposal = BoxList(boxes.new_zeros((0, self.box_dim)), (img_w, img_h), self._boxlist_mode())
+            if proposal.mode == "xywha":
+                set_boxlist_angle_unit(proposal, self.obb_angle_unit)
             proposal.add_field("pred_scores", proposal_scores)
             proposal.add_field("scores", proposal_scores)
             proposal.add_field("pred_labels", torch.zeros((0,), dtype=torch.long, device=boxes.device))
@@ -895,6 +940,7 @@ class SceneGraphDetector(nn.Module):
             self.nms_thresh,
             mode=self.box_mode,
             obb_fallback_to_hbb=self.obb_fallback_to_hbb,
+            angle_unit=self.obb_angle_unit,
         )
         nms_keep = nms_keep[: self.max_proposals]
         boxes = boxes[nms_keep]
@@ -902,6 +948,8 @@ class SceneGraphDetector(nn.Module):
 
         img_h, img_w = image_size
         proposal = BoxList(boxes, (img_w, img_h), self._boxlist_mode())
+        if proposal.mode == "xywha":
+            set_boxlist_angle_unit(proposal, self.obb_angle_unit)
         proposal.add_field("pred_scores", proposal_scores)
         proposal.add_field("scores", proposal_scores)
         proposal.add_field("pred_labels", torch.zeros((len(proposal),), dtype=torch.long, device=boxes.device))
@@ -950,26 +998,48 @@ class SceneGraphDetector(nn.Module):
             for key, value in zip(self.feature_keys, feats)
         }
 
+    def _extract_features_d2(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if self.backbone_d2 is None:
+            raise RuntimeError("detector d2 branch is not initialized. Set MODEL.STORE_DETECTOR_D2=True.")
+        backbone_feats = self.backbone_d2(images)
+        if isinstance(backbone_feats, torch.Tensor):
+            backbone_feats = [backbone_feats]
+        if self.neck_d2 is not None:
+            feats = self.neck_d2(backbone_feats)
+        else:
+            feats = backbone_feats
+        if isinstance(feats, torch.Tensor):
+            feats = [feats]
+        return {
+            key: value
+            for key, value in zip(self.feature_keys, feats)
+        }
+
     def load_detector_pretrained(self, checkpoint_path: str):
         checkpoint_path = str(Path(checkpoint_path).expanduser())
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
         model_state = self.state_dict()
         loadable = {}
-        skipped_d2 = 0
         loaded_keys = []
         missing_in_model = []
         shape_mismatches = []
+        d2_total = 0
+        d2_loaded = 0
         for key, value in state_dict.items():
-            if any(part.endswith("d2") for part in key.split(".")):
-                skipped_d2 += 1
-                continue
             new_key = key
+            is_d2 = any(part.endswith("d2") for part in key.split("."))
+            if is_d2:
+                d2_total += 1
             if new_key.startswith("backbone.patch_embed.projection."):
                 new_key = "backbone.patch_embed.proj." + new_key[len("backbone.patch_embed.projection."):]
+            if new_key.startswith("backbone_d2.patch_embed.projection."):
+                new_key = "backbone_d2.patch_embed.proj." + new_key[len("backbone_d2.patch_embed.projection."):]
             if new_key in model_state and model_state[new_key].shape == value.shape:
                 loadable[new_key] = value
                 loaded_keys.append(new_key)
+                if is_d2:
+                    d2_loaded += 1
             elif new_key not in model_state:
                 missing_in_model.append((key, new_key))
             else:
@@ -977,7 +1047,7 @@ class SceneGraphDetector(nn.Module):
         missing, unexpected = self.load_state_dict(loadable, strict=False)
         print(
             f"Loaded detector pretrained weights from {checkpoint_path}: "
-            f"{len(loadable)} tensors, skipped_d2={skipped_d2}, "
+            f"{len(loadable)} tensors, d2_loaded={d2_loaded}/{d2_total}, "
             f"skipped_unmatched={len(missing_in_model) + len(shape_mismatches)}, "
             f"missing={len(missing)}, unexpected={len(unexpected)}"
         )
@@ -1066,6 +1136,18 @@ class SceneGraphDetector(nn.Module):
             return neck, out_channels
         return None, backbone_channels[-1]
 
+    def _build_standalone_rpn_head(self, rpn_cfg: Dict, in_channels: int) -> Optional[RotatedRPNHead]:
+        if rpn_cfg.get("NAME", "") != "oriented_rpn_head":
+            return None
+        return RotatedRPNHead(
+            in_channels=int(rpn_cfg.get("IN_CHANNELS", in_channels)),
+            feat_channels=int(rpn_cfg.get("FEAT_CHANNELS", in_channels)),
+            num_anchors=int(rpn_cfg.get("NUM_ANCHORS", 3)),
+            cls_out_channels=int(rpn_cfg.get("CLS_OUT_CHANNELS", 1)),
+            version=rpn_cfg.get("VERSION", "le90"),
+            use_sigmoid_cls=bool(rpn_cfg.get("USE_SIGMOID_CLS", True)),
+        )
+
     def _build_standalone_roi_head(self, model_cfg: Dict, in_channels: int) -> Optional[OrientedStandardRoIHead]:
         if model_cfg.get("RPN_ONLY", False):
             return None
@@ -1088,6 +1170,7 @@ class SceneGraphDetector(nn.Module):
                 angle_range=model_cfg.get("ANGLE_VERSION", "le90"),
                 edge_swap=True,
                 proj_xy=True,
+                angle_unit=self.obb_angle_unit,
             ),
             max_per_img=int(model_cfg.get("ROI_HEADS", {}).get("DETECTIONS_PER_IMG", 100)),
         )
