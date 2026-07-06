@@ -7,33 +7,14 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-pyg}"
 DEVICE="${DEVICE:-cuda}"
-EXPERIMENT="${EXPERIMENT:-legacy_6850}"
+CONFIG="${CONFIG:-configs/star_predcls_obb_train.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_train}"
+INIT_RPCM="${INIT_RPCM-/home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth}"
 START_EPOCH="${START_EPOCH:-}"
 RESUME="${RESUME:-}"
+LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/train.log}"
 
 cd "${ROOT_DIR}"
-
-case "${EXPERIMENT}" in
-  main|legacy|legacy_6850)
-    CONFIG="${CONFIG:-configs/star_predcls_obb_rpcm_legacy_ppg_6850_train.py}"
-    OUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_rpcm_legacy_ppg_6850}"
-    INIT_RPCM_DEFAULT="/home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth"
-    ;;
-  legacy_17000)
-    CONFIG="${CONFIG:-configs/star_predcls_obb_rpcm_legacy_ppg_train.py}"
-    OUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_rpcm_legacy_ppg_17000}"
-    INIT_RPCM_DEFAULT="/home/ubuntu/research/ssd/RPCM/Checkpoints/LOBB_RPCM_predcls_train/17000.pth"
-    export PREDICT_USE_BIAS="${PREDICT_USE_BIAS:-1}"
-    ;;
-  *)
-    echo "Unknown EXPERIMENT='${EXPERIMENT}'" >&2
-    echo "Available: main, legacy, legacy_6850, legacy_17000" >&2
-    exit 2
-    ;;
-esac
-
-INIT_RPCM="${INIT_RPCM-${INIT_RPCM_DEFAULT}}"
-LOG_FILE="${LOG_FILE:-${OUT_DIR}/train.log}"
 
 if [[ ! -f "${CONFIG}" ]]; then
   echo "Config not found: ${CONFIG}" >&2
@@ -49,9 +30,9 @@ if [[ -z "${RESUME}" && -n "${INIT_RPCM}" && ! -f "${INIT_RPCM}" ]]; then
   exit 1
 fi
 
-mkdir -p "${OUT_DIR}"
-STATUS_FILE="${OUT_DIR}/exit_code.txt"
-PID_FILE="${OUT_DIR}/train.pid"
+mkdir -p "${OUTPUT_DIR}"
+STATUS_FILE="${OUTPUT_DIR}/exit_code.txt"
+PID_FILE="${OUTPUT_DIR}/train.pid"
 rm -f "${STATUS_FILE}"
 
 source "${CONDA_SH}"
@@ -86,11 +67,11 @@ fi
 pid="$!"
 printf "%s\n" "${pid}" > "${PID_FILE}"
 
-echo "Started STAR RPCM LEGACY experiment: ${EXPERIMENT}"
+echo "Started STAR main experiment"
 echo "PID: ${pid}"
 echo "Config: ${CONFIG}"
 echo "Init RPCM: ${INIT_RPCM:-<none>}"
 echo "Resume: ${RESUME:-<none>}"
-echo "Output: ${OUT_DIR}"
+echo "Output: ${OUTPUT_DIR}"
 echo "Log: ${LOG_FILE}"
 echo "Status: ${STATUS_FILE}"

@@ -37,8 +37,8 @@ def find_dataset_index(dataset, image_id: int) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Dump one-image current RPCM LEGACY intermediate tensors.")
-    parser.add_argument("--config", default="configs/star_predcls_obb_rpcm_legacy_ppg_6850_train.py")
+    parser = argparse.ArgumentParser(description="Dump one-image current RPCM intermediate tensors.")
+    parser.add_argument("--config", default="configs/star_predcls_obb_train.py")
     parser.add_argument("--checkpoint", default="/home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth")
     parser.add_argument("--split", default="test", choices=("train", "val", "test"))
     parser.add_argument("--image-id", type=int, default=4)

@@ -85,11 +85,11 @@ export STAR_SGG_ROOT=/path/to/STAR_SGG
 bash scripts/eval_once.sh
 ```
 
-The active STAR experiment path is the aligned RPCM LEGACY + PPG predcls setup. The scripts in `scripts/` are intentionally kept small:
+The active STAR experiment path is the aligned RPCM + PPG predcls setup. The scripts in `scripts/` are intentionally kept small:
 
-- `run_star_experiment.sh`: launch the main aligned RPCM LEGACY training flow.
-- `eval_once.sh`: evaluate the aligned RPCM LEGACY checkpoint.
-- `resume_star.sh`: resume the aligned RPCM LEGACY training flow.
+- `run_star_experiment.sh`: launch the main aligned RPCM training flow.
+- `eval_once.sh`: evaluate the aligned RPCM checkpoint.
+- `resume_star.sh`: resume the aligned RPCM training flow.
 - `dump_rpcm_current_probe.py`, `dump_rpcm_original_probe.py`, `compare_rpcm_probe_dumps.py`: one-image numeric alignment tools for checking the current implementation against the original RPCM repository.
 
 ## Reproducibility notes

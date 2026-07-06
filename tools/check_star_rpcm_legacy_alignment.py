@@ -50,8 +50,8 @@ def gt_pair_recall(candidate_pairs: torch.Tensor, relations: torch.Tensor) -> tu
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Check current project vs original RPCM legacy assumptions on STAR.")
-    parser.add_argument("--config", default="configs/star_predcls_obb_rpcm_legacy_ppg_train.py")
+    parser = argparse.ArgumentParser(description="Check current project RPCM assumptions on STAR.")
+    parser.add_argument("--config", default="configs/star_predcls_obb_train.py")
     parser.add_argument("--split", default="val", choices=("train", "val", "test"))
     parser.add_argument("--num-images", type=int, default=4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
