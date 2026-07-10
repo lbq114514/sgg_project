@@ -17,6 +17,12 @@ from pathlib import Path
 from sgg.data.build import build_dataloaders
 from sgg.evaluation import evaluate_sgg
 from sgg.modeling.roi_heads.typed_hyper_rpcm import build_family_predicates
+from sgg.modeling.detectors.class_channel_order import (
+    BACKGROUND_LAST,
+    INTERNAL_DETECTOR_CLASS_ORDER,
+    is_detector_classifier_key,
+    reorder_detector_classifier_rows,
+)
 from sgg.structures.boxes import BoxList
 from sgg.structures.boxlist_ops import boxlist_iou
 
@@ -740,15 +746,23 @@ class Trainer:
 
     def _apply_freeze_config(self):
         model_cfg = self.cfg.get("MODEL", {})
+        sgdet_compat_freeze = (
+            str(model_cfg.get("TASK", "")).lower() == "sgdet"
+            and bool(model_cfg.get("SGDET_COMPAT", {}).get("ENABLED", False))
+            and bool(model_cfg.get("SGDET_COMPAT", {}).get("FREEZE_DETECTOR", True))
+        )
         freeze_map = {
-            "backbone": bool(model_cfg.get("FREEZE_BACKBONE", False)),
-            "backbone_d2": bool(model_cfg.get("FREEZE_BACKBONE", False)),
-            "neck": bool(model_cfg.get("FREEZE_NECK", False)),
-            "neck_d2": bool(model_cfg.get("FREEZE_NECK", False)),
-            "rpn_head": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
-            "rpn_head_d2": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
-            "roi_head": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
-            "roi_head_d2": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
+            "backbone": bool(model_cfg.get("FREEZE_BACKBONE", False)) or sgdet_compat_freeze,
+            "backbone_d2": bool(model_cfg.get("FREEZE_BACKBONE", False)) or sgdet_compat_freeze,
+            "neck": bool(model_cfg.get("FREEZE_NECK", False)) or sgdet_compat_freeze,
+            "neck_d2": bool(model_cfg.get("FREEZE_NECK", False)) or sgdet_compat_freeze,
+            "rpn_head": bool(model_cfg.get("FREEZE_RPN_HEAD", False)) or sgdet_compat_freeze,
+            "rpn_head_d2": bool(model_cfg.get("FREEZE_RPN_HEAD", False)) or sgdet_compat_freeze,
+            "roi_head": bool(model_cfg.get("FREEZE_ROI_HEAD", False)) or sgdet_compat_freeze,
+            "roi_head_d2": bool(model_cfg.get("FREEZE_ROI_HEAD", False)) or sgdet_compat_freeze,
+            "det_tower": sgdet_compat_freeze,
+            "rpn_objectness_head": sgdet_compat_freeze,
+            "rpn_box_head": sgdet_compat_freeze,
         }
         for module_name, should_freeze in freeze_map.items():
             if not should_freeze or not hasattr(self.model, module_name):
@@ -763,21 +777,32 @@ class Trainer:
 
     def _set_frozen_modules_eval(self):
         model_cfg = self.cfg.get("MODEL", {})
+        sgdet_compat_freeze = (
+            str(model_cfg.get("TASK", "")).lower() == "sgdet"
+            and bool(model_cfg.get("SGDET_COMPAT", {}).get("ENABLED", False))
+            and bool(model_cfg.get("SGDET_COMPAT", {}).get("FREEZE_DETECTOR", True))
+        )
         for module_name, should_freeze in {
-            "backbone": bool(model_cfg.get("FREEZE_BACKBONE", False)),
-            "backbone_d2": bool(model_cfg.get("FREEZE_BACKBONE", False)),
-            "neck": bool(model_cfg.get("FREEZE_NECK", False)),
-            "neck_d2": bool(model_cfg.get("FREEZE_NECK", False)),
-            "rpn_head": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
-            "rpn_head_d2": bool(model_cfg.get("FREEZE_RPN_HEAD", False)),
-            "roi_head": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
-            "roi_head_d2": bool(model_cfg.get("FREEZE_ROI_HEAD", False)),
+            "backbone": bool(model_cfg.get("FREEZE_BACKBONE", False)) or sgdet_compat_freeze,
+            "backbone_d2": bool(model_cfg.get("FREEZE_BACKBONE", False)) or sgdet_compat_freeze,
+            "neck": bool(model_cfg.get("FREEZE_NECK", False)) or sgdet_compat_freeze,
+            "neck_d2": bool(model_cfg.get("FREEZE_NECK", False)) or sgdet_compat_freeze,
+            "rpn_head": bool(model_cfg.get("FREEZE_RPN_HEAD", False)) or sgdet_compat_freeze,
+            "rpn_head_d2": bool(model_cfg.get("FREEZE_RPN_HEAD", False)) or sgdet_compat_freeze,
+            "roi_head": bool(model_cfg.get("FREEZE_ROI_HEAD", False)) or sgdet_compat_freeze,
+            "roi_head_d2": bool(model_cfg.get("FREEZE_ROI_HEAD", False)) or sgdet_compat_freeze,
+            "det_tower": sgdet_compat_freeze,
+            "rpn_objectness_head": sgdet_compat_freeze,
+            "rpn_box_head": sgdet_compat_freeze,
         }.items():
             if should_freeze and hasattr(self.model, module_name):
                 module = getattr(self.model, module_name)
                 if module is not None:
                     for param in module.parameters():
                         param.requires_grad = False
+                    # Match SGG-Toolkit's relation training: freeze detector
+                    # parameters after model.train(), but keep module.training
+                    # unchanged so detector train-mode branches still run.
 
     def _build_optimizer(self, model: torch.nn.Module):
         solver_cfg = self.cfg["SOLVER"]
@@ -910,6 +935,7 @@ class Trainer:
             "scheduler": self.scheduler.state_dict() if hasattr(self.scheduler, "state_dict") else None,
             "global_step": self.global_step,
             "cfg": self.cfg,
+            "detector_class_channel_order": INTERNAL_DETECTOR_CLASS_ORDER,
         }
         if metrics is not None:
             payload["metrics"] = metrics
@@ -919,6 +945,23 @@ class Trainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
+        checkpoint_class_order = (
+            ckpt.get("detector_class_channel_order") if isinstance(ckpt, dict) else None
+        )
+        if checkpoint_class_order is None:
+            print(
+                "Checkpoint detector class-channel order: <unmarked>; "
+                "loading unchanged as background_first for backward compatibility. "
+                "Migrate explicitly before using an old checkpoint for sgcls/sgdet "
+                "if its detector was initialized from the original background-last STAR OBB weights.",
+                flush=True,
+            )
+        else:
+            print(
+                "Checkpoint detector class-channel order: "
+                f"{checkpoint_class_order}",
+                flush=True,
+            )
         state_dict = self._checkpoint_state_dict(ckpt)
         incompatible = self.model.load_state_dict(state_dict, strict=False)
         filter_prefixes = (
@@ -946,7 +989,7 @@ class Trainer:
                 {"missing": ignored_missing, "unexpected": ignored_unexpected},
                 flush=True,
             )
-        if isinstance(ckpt, dict) and "optimizer" in ckpt:
+        if isinstance(ckpt, dict) and ckpt.get("optimizer") is not None:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         if isinstance(ckpt, dict) and ckpt.get("scheduler") is not None and hasattr(self.scheduler, "load_state_dict"):
             self.scheduler.load_state_dict(ckpt["scheduler"])
@@ -963,6 +1006,182 @@ class Trainer:
                     return value
         return ckpt
 
+    @staticmethod
+    def _legacy_rpcm_key_candidates(key: str) -> list[str]:
+        candidates = [key]
+        if ".patch_embed.projection." in key:
+            candidates.append(key.replace(".patch_embed.projection.", ".patch_embed.proj."))
+        if key.startswith("roi_heads.relation.PPG."):
+            candidates.append("roi_heads.relation.ppg." + key[len("roi_heads.relation.PPG."):])
+        if key.startswith("roi_heads.relation.union_feature_extractor.feature_extractor.fc6."):
+            candidates.append(
+                "roi_heads.relation.union_feature_extractor.head.1."
+                + key[len("roi_heads.relation.union_feature_extractor.feature_extractor.fc6."):]
+            )
+        if key.startswith("roi_heads.relation.box_feature_extractor.fc6."):
+            candidates.append(
+                "roi_heads.relation.box_feature_extractor.head.1."
+                + key[len("roi_heads.relation.box_feature_extractor.fc6."):]
+            )
+        if key.startswith("roi_heads.box.feature_extractor.fc6."):
+            suffix = key[len("roi_heads.box.feature_extractor.fc6."):]
+            candidates.extend(
+                [
+                    "roi_head.bbox_head.shared_fcs.0." + suffix,
+                    "roi_head_d2.bbox_head.shared_fcs.0." + suffix,
+                ]
+            )
+        if key.startswith("roi_heads.box.feature_extractor.fc7."):
+            suffix = key[len("roi_heads.box.feature_extractor.fc7."):]
+            candidates.extend(
+                [
+                    "roi_head.bbox_head.shared_fcs.1." + suffix,
+                    "roi_head_d2.bbox_head.shared_fcs.1." + suffix,
+                ]
+            )
+        if key.startswith("roi_heads.box.predictor.cls_score."):
+            suffix = key[len("roi_heads.box.predictor.cls_score."):]
+            candidates.extend(
+                [
+                    "roi_head.bbox_head.fc_cls." + suffix,
+                    "roi_head_d2.bbox_head.fc_cls." + suffix,
+                ]
+            )
+        return candidates
+
+    def _load_legacy_rpcm_model_only(self, source: dict, path: str):
+        target = self.model.state_dict()
+        predictor_prefix = "roi_heads.relation.predictor."
+        update = {}
+        remapped = {}
+        skipped_shape = []
+        used_source_keys = set()
+        reordered_detector_classifier = []
+
+        for source_key, source_value in source.items():
+            if source_key not in target:
+                continue
+            if not hasattr(source_value, "shape") or source_value.shape != target[source_key].shape:
+                skipped_shape.append(
+                    (
+                        source_key,
+                        source_key,
+                        tuple(source_value.shape) if hasattr(source_value, "shape") else "<no-shape>",
+                        tuple(target[source_key].shape),
+                    )
+                )
+                continue
+            value_to_load = source_value
+            # A legacy RPCM file can already expose the mmrotate detector
+            # classifier under its current key.  It is still background-last;
+            # direct loading must not bypass the conversion applied to the
+            # old ``roi_heads.box.predictor.cls_score`` alias below.
+            if is_detector_classifier_key(source_key):
+                value_to_load = reorder_detector_classifier_rows(
+                    source_value,
+                    source_order=BACKGROUND_LAST,
+                    target_order=INTERNAL_DETECTOR_CLASS_ORDER,
+                )
+                reordered_detector_classifier.append((source_key, source_key))
+            update[source_key] = value_to_load
+            used_source_keys.add(source_key)
+
+        for source_key, source_value in source.items():
+            candidates = self._legacy_rpcm_key_candidates(source_key)[1:]
+            if not candidates:
+                continue
+            loaded_targets = []
+            for target_key in candidates:
+                if target_key not in target or target_key in update:
+                    continue
+                if not hasattr(source_value, "shape") or source_value.shape != target[target_key].shape:
+                    skipped_shape.append(
+                        (
+                            source_key,
+                            target_key,
+                            tuple(source_value.shape) if hasattr(source_value, "shape") else "<no-shape>",
+                            tuple(target[target_key].shape),
+                        )
+                    )
+                    continue
+                value_to_load = source_value
+                if (
+                    source_key.startswith("roi_heads.box.predictor.cls_score.")
+                    and is_detector_classifier_key(target_key)
+                ):
+                    value_to_load = reorder_detector_classifier_rows(
+                        source_value,
+                        source_order=BACKGROUND_LAST,
+                        target_order=INTERNAL_DETECTOR_CLASS_ORDER,
+                    )
+                    reordered_detector_classifier.append((source_key, target_key))
+                update[target_key] = value_to_load
+                loaded_targets.append(target_key)
+            if loaded_targets:
+                used_source_keys.add(source_key)
+                remapped[source_key] = loaded_targets
+
+        loaded_predictor = [key for key in update if key.startswith(predictor_prefix)]
+        if not loaded_predictor:
+            raise RuntimeError(f"No compatible legacy RPCM predictor weights found in {path}")
+
+        merged = dict(target)
+        merged.update(update)
+        incompatible = self.model.load_state_dict(merged, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Internal legacy RPCM initialization failed unexpectedly: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
+
+        ignored_unloaded_prefixes = (
+            "roi_heads.relation.ppg.",
+            "roi_heads.relation.ppn.",
+        )
+        unloaded_target = [
+            key for key in target
+            if key not in update and not key.startswith(ignored_unloaded_prefixes)
+        ]
+        unused_source = [
+            key for key in source
+            if key not in used_source_keys and not key.startswith("roi_heads.relation.PPG_HBB.")
+        ]
+        report = {
+            "checkpoint": path,
+            "loaded": len(update),
+            "loaded_predictor": len(loaded_predictor),
+            "remapped": len(remapped),
+            "unloaded_target": len(unloaded_target),
+            "unused_source": len(unused_source),
+            "skipped_shape": len(skipped_shape),
+            "reordered_detector_classifier": len(reordered_detector_classifier),
+        }
+        print("Legacy RPCM model-only initialization:", report, flush=True)
+        if remapped:
+            print("Legacy key remaps:", list(remapped.items())[:20], flush=True)
+        if unloaded_target:
+            print("Unloaded target keys sample:", unloaded_target[:30], flush=True)
+        if unused_source:
+            print("Unused source keys sample:", unused_source[:30], flush=True)
+        if skipped_shape:
+            print("Skipped shape mismatch sample:", skipped_shape[:20], flush=True)
+        if reordered_detector_classifier:
+            print(
+                "Legacy detector classifier rows reordered (background_last->background_first):",
+                reordered_detector_classifier,
+                flush=True,
+            )
+        return {
+            "checkpoint": path,
+            "loaded": sorted(update),
+            "loaded_predictor": sorted(loaded_predictor),
+            "remapped": remapped,
+            "unloaded_target": unloaded_target,
+            "unused_source": unused_source,
+            "skipped_shape": skipped_shape,
+            "reordered_detector_classifier": reordered_detector_classifier,
+        }
+
     def load_rpcm_predictor_weights(self, path: str):
         """Initialize the compatible TypedHyperRPCM blocks from an RPCM checkpoint."""
         ckpt = torch.load(path, map_location="cpu")
@@ -972,36 +1191,14 @@ class Trainer:
         predictor_name = str(
             self.cfg.get("MODEL", {}).get("ROI_RELATION_HEAD", {}).get("PREDICTOR", "")
         )
-        if predictor_name == "RPCM_LEGACY":
-            loaded, shape_mismatch, missing = [], [], []
-            update = {}
-            for key, target_value in target.items():
-                if not key.startswith(predictor_prefix):
-                    continue
-                if key not in source:
-                    missing.append(key)
-                elif source[key].shape != target_value.shape:
-                    shape_mismatch.append((key, tuple(source[key].shape), tuple(target_value.shape)))
-                else:
-                    update[key] = source[key]
-                    loaded.append(key)
-            unexpected = [
-                key for key in source
-                if key.startswith(predictor_prefix) and key not in target
-            ]
-            if missing or shape_mismatch or unexpected:
-                raise RuntimeError(
-                    "RPCM_LEGACY predictor checkpoint is incompatible: "
-                    f"missing={missing}, shape_mismatch={shape_mismatch}, unexpected={unexpected}"
-                )
-            target.update(update)
-            self.model.load_state_dict(target, strict=True)
-            print(
-                "RPCM_LEGACY predictor initialization:",
-                {"checkpoint": path, "loaded_predictor_keys": len(loaded)},
-                flush=True,
-            )
-            return {"checkpoint": path, "loaded": loaded}
+        if predictor_name.upper() in {
+            "RPCM_LEGACY",
+            "LEGACY_RPCM",
+            "RPCM_ORIGINAL_LEGACY",
+            "ORIGINAL_RPCM_LEGACY",
+            "RPCM_NATIVE_LEGACY",
+        }:
+            return self._load_legacy_rpcm_model_only(source, path)
 
         shared_prefixes = (
             "pairwise_feature_extractor.",
@@ -1125,6 +1322,31 @@ class Trainer:
     def _move_targets(self, targets):
         return [t.to(self.device) for t in targets]
 
+    def _sgdet_detector_inputs_from_metas(self, metas):
+        """Build the raw-resolution detector stream for STAR Sgdets.
+
+        The normal ``images`` batch is the relation-scale (typically 1024px)
+        stream.  When a STAR sgdet dataset provides the original image/target
+        pair in metadata, pad and move it independently for the frozen d1/d2
+        patch detector.  Returning ``None`` preserves compatibility with
+        external datasets and existing direct model callers.
+        """
+        if str(self.cfg["MODEL"].get("TASK", "")).lower() != "sgdet":
+            return None, None
+        raw_images = [meta.get("sgdet_detector_image") for meta in metas]
+        raw_targets = [
+            meta.get("sgdet_detector_target", meta.get("sgdet_detector_size"))
+            for meta in metas
+        ]
+        if not raw_images or any(image is None for image in raw_images) or any(
+            target is None for target in raw_targets
+        ):
+            return None, None
+        # Keep full-resolution imagery on CPU.  SceneGraphDetector crops and
+        # transfers only 1024px patches to CUDA, mirroring the original
+        # detector and avoiding a giant padded (B,C,H,W) GPU allocation.
+        return list(raw_images), list(raw_targets)
+
     def train(self, start_epoch: int = 0):
         val_split = str(self.cfg.get("SOLVER", {}).get("VAL_SPLIT", "val")).lower()
         loaders = self.dataloaders or build_dataloaders(
@@ -1145,6 +1367,37 @@ class Trainer:
             1, int(self.cfg.get("SOLVER", {}).get("GRADIENT_ACCUMULATION_STEPS", 1))
         )
         optimizer_steps_per_epoch = max(1, (len(train_loader) + accumulation_steps - 1) // accumulation_steps)
+        # Original SGG-Toolkit task scripts specify MAX_ITER / VAL_PERIOD in
+        # optimizer steps.  Preserve that contract for the OBB compatibility
+        # configs while retaining epoch-based behavior for existing runs.
+        max_iterations = max(0, int(self.cfg.get("SOLVER", {}).get("MAX_ITER", 0)))
+        iteration_compat = bool(self.cfg.get("SOLVER", {}).get("ITERATION_COMPAT", False))
+        val_period_iter = max(
+            0,
+            int(
+                self.cfg.get("SOLVER", {}).get(
+                    "VAL_PERIOD" if iteration_compat else "VAL_PERIOD_ITER", 0
+                )
+            ),
+        )
+        val_start_iter = max(
+            0,
+            int(
+                self.cfg.get("SOLVER", {}).get(
+                    "VAL_START_PERIOD" if iteration_compat else "VAL_START_ITER", 0
+                )
+            ),
+        )
+        if val_period_iter > 0:
+            self.val_period = max(1, math.ceil(val_period_iter / optimizer_steps_per_epoch))
+        if val_start_iter > 0:
+            self.val_start_period = max(1, math.ceil(val_start_iter / optimizer_steps_per_epoch))
+        if max_iterations > 0:
+            required_epochs = math.ceil(max(max_iterations - self.global_step, 0) / optimizer_steps_per_epoch)
+            # MAX_ITER is the primary termination contract of the original
+            # SGG-Toolkit scripts; MAX_EPOCHS remains an optional explicit
+            # safety cap for smoke runs.
+            epochs = min(int(epochs), int(start_epoch) + max(required_epochs, 1))
         best_recall_k = max(int(k) for k in self.cfg.get("TEST", {}).get("RECALL_AT", [100]))
         if self.warmup_iters <= 0 and self.warmup_epochs > 0:
             self.warmup_iters = int(round(self.warmup_epochs * optimizer_steps_per_epoch))
@@ -1153,6 +1406,8 @@ class Trainer:
         start_epoch = max(0, min(int(start_epoch), int(epochs)))
         epoch_durations: List[float] = []
         for epoch in range(start_epoch, epochs):
+            if max_iterations > 0 and self.global_step >= max_iterations:
+                break
             # PairGraphBuilder reads this value to apply the GT-injection schedule.
             self.cfg["_CURRENT_EPOCH"] = epoch + 1
             epoch_start = time.perf_counter()
@@ -1162,10 +1417,24 @@ class Trainer:
             epoch_loss_count = 0
             pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{epochs}", disable=_disable_tqdm_for_non_tty())
             self.optimizer.zero_grad(set_to_none=True)
-            for batch_idx, (images, targets, _) in enumerate(pbar):
+            reached_max_iterations = False
+            for batch_idx, (images, targets, metas) in enumerate(pbar):
+                if max_iterations > 0 and self.global_step >= max_iterations:
+                    reached_max_iterations = True
+                    break
                 images = images.to(self.device)
                 targets = self._move_targets(targets)
-                loss_dict = self.model(images, targets)
+                # Keep the raw detector stream separate from the resized
+                # relation stream for STAR Sgdets; it is ignored elsewhere.
+                # ``metas`` is intentionally retained by the data loader so
+                # this does not alter the public batch tuple contract.
+                detector_images, detector_targets = self._sgdet_detector_inputs_from_metas(metas)
+                loss_dict = self.model(
+                    images,
+                    targets,
+                    detector_images=detector_images,
+                    detector_targets=detector_targets,
+                )
                 loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
                 (loss / accumulation_steps).backward()
                 grad_total_norm = None
@@ -1181,6 +1450,17 @@ class Trainer:
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
+                    if (
+                        iteration_compat
+                        and self.checkpoint_period > 0
+                        and self.global_step % self.checkpoint_period == 0
+                    ):
+                        self.save_checkpoint(
+                            epoch + 1,
+                            f"model_iter_{self.global_step:07d}.pth",
+                        )
+                    if max_iterations > 0 and self.global_step >= max_iterations:
+                        reached_max_iterations = True
                 loss_values = {
                     k: float(v.detach().cpu())
                     for k, v in loss_dict.items()
@@ -1251,6 +1531,9 @@ class Trainer:
                 },
                 flush=True,
             )
+            if reached_max_iterations:
+                print(f"Reached SOLVER.MAX_ITER={max_iterations}; stopping training.", flush=True)
+                break
 
     @torch.no_grad()
     def evaluate_loader(self, loader, return_result: bool = False):
@@ -1262,6 +1545,7 @@ class Trainer:
         for batch_idx, (images, targets, metas) in enumerate(tqdm(loader, desc="Validation", disable=_disable_tqdm_for_non_tty())):
             images = images.to(self.device)
             targets = self._move_targets(targets)
+            detector_images, detector_targets = self._sgdet_detector_inputs_from_metas(metas)
             batch_image_ids = []
             for target, meta in zip(targets, metas):
                 image_id = meta.get("image_id")
@@ -1281,7 +1565,15 @@ class Trainer:
                     flush=True,
                 )
             try:
-                preds = self.model(images, targets if self.cfg["MODEL"]["TASK"] != "sgdet" else None)
+                preds = self.model(
+                    images,
+                    # Sgdet relation evaluation itself stays target-free, but
+                    # SceneGraphDetector needs the resized targets here to
+                    # convert raw detector boxes into relation-image coords.
+                    targets,
+                    detector_images=detector_images,
+                    detector_targets=detector_targets,
+                )
             except torch.cuda.OutOfMemoryError:
                 if graph_debug_enabled:
                     print(

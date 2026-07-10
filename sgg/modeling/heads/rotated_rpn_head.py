@@ -69,6 +69,7 @@ class RotatedRPNHead(nn.Module):
         bbox_loss_fn=None,
         nms_fn=None,
         nms_iou_threshold=0.7,
+        angle_unit="degree",
     ):
         super().__init__()
 
@@ -85,6 +86,7 @@ class RotatedRPNHead(nn.Module):
         self.min_bbox_size = min_bbox_size
         self.max_per_img = max_per_img
         self.nms_iou_threshold = nms_iou_threshold
+        self.angle_unit = angle_unit
 
         self.anchor_generator = anchor_generator
         self.bbox_coder = bbox_coder
@@ -360,7 +362,7 @@ class RotatedRPNHead(nn.Module):
         if proposals.numel() == 0:
             return proposals.new_zeros((0, 6))
 
-        hproposals = obb2xyxy(proposals, self.version)
+        hproposals = obb2xyxy(proposals, self.version, angle_unit=self.angle_unit)
         dets, keep = self.nms_fn(
             hproposals,
             scores,

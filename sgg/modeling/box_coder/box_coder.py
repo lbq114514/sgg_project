@@ -446,11 +446,13 @@ class MidpointOffsetBoxCoder:
         target_stds=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
         angle_range="oc",
         wh_ratio_clip=16 / 1000,
+        angle_unit="degree",
     ):
         self.means = target_means
         self.stds = target_stds
         self.version = angle_range
         self.wh_ratio_clip = wh_ratio_clip
+        self.angle_unit = normalize_angle_unit(angle_unit)
 
     def encode(self, bboxes, gt_bboxes):
         """
@@ -483,8 +485,8 @@ class MidpointOffsetBoxCoder:
         pw = proposals[..., 2] - proposals[..., 0]
         ph = proposals[..., 3] - proposals[..., 1]
 
-        hbb = obb2xyxy(gt, self.version)
-        poly = obb2poly(gt, self.version)
+        hbb = obb2xyxy(gt, self.version, angle_unit=self.angle_unit)
+        poly = obb2poly(gt, self.version, angle_unit=self.angle_unit)
         gx = (hbb[..., 0] + hbb[..., 2]) * 0.5
         gy = (hbb[..., 1] + hbb[..., 3]) * 0.5
         gw = hbb[..., 2] - hbb[..., 0]
@@ -562,7 +564,7 @@ class MidpointOffsetBoxCoder:
         diag_scale_factor = max_diag_len / diag_len
         center_polys = center_polys * diag_scale_factor.repeat_interleave(2, dim=-1)
         rectpolys = center_polys + center
-        obboxes = poly2obb(rectpolys, self.version)
+        obboxes = poly2obb(rectpolys, self.version, angle_unit=self.angle_unit)
 
         if max_shape is not None and len(max_shape) >= 2:
             h, w = max_shape[:2]

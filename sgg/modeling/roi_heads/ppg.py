@@ -47,8 +47,11 @@ class PairProposalGenerator(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
-        self.enabled = bool(rel_cfg.get("PPG_ENABLED", False))
-        self.filter_method = str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper()
+        self.filter_method = str(rel_cfg.get("TEST_FILTER_METHOD", "PPG")).upper()
+        # TEST_FILTER_METHOD is the single source of truth.  PPG_ENABLED is kept
+        # in configs only for old experiment compatibility and is intentionally
+        # not required by the runtime path.
+        self.enabled = self.filter_method == "PPG"
         self.threshold = int(rel_cfg.get("PPG_PAIR_THRESHOLD", 10000))
         self.topk = int(rel_cfg.get("PPG_TOPK", 10000))
         self.chunk_size = max(1, int(rel_cfg.get("PPG_CHUNK_SIZE", 65536)))
@@ -77,7 +80,7 @@ class PairProposalGenerator(nn.Module):
         self._load_weights()
 
     def _load_weights(self) -> None:
-        if not self.enabled or self.filter_method != "PPG":
+        if self.filter_method != "PPG":
             return
         if not self.model_path.is_file():
             print(f"PPG weights not found: {self.model_path}", flush=True)
@@ -100,8 +103,7 @@ class PairProposalGenerator(nn.Module):
 
     def should_filter(self, pair_idx: torch.Tensor) -> bool:
         return (
-            self.enabled
-            and self.filter_method == "PPG"
+            self.filter_method == "PPG"
             and self.loaded
             and pair_idx.numel() > 0
             and pair_idx.size(0) > self.threshold

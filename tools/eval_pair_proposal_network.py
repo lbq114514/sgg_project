@@ -197,7 +197,6 @@ def main():
         rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
         cfg["MODEL"]["BOX_MODE"] = "obb"
         cfg["MODEL"]["ROI_BOX_HEAD"]["NUM_CLASSES"] = len(source.ind_to_classes)
-        rel_cfg["PPG_ENABLED"] = True
         rel_cfg["TEST_FILTER_METHOD"] = "PPG"
         rel_cfg["PPG_MODEL_PATH_OBB"] = args.ppg_checkpoint
         rel_cfg["PPG_CHUNK_SIZE"] = args.block_size

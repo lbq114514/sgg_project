@@ -19,6 +19,30 @@ def get_default_cfg():
             "FREEZE_NECK": False,
             "FREEZE_RPN_HEAD": False,
             "FREEZE_ROI_HEAD": False,
+            # Original SGG-Toolkit OBB detector compatibility.  The fields
+            # mirror its mmrotate train/test config while keeping the public
+            # SceneGraphDetector API unchanged.
+            "SGDET_COMPAT": {
+                "ENABLED": False,
+                "FREEZE_DETECTOR": True,
+                "USE_D2": True,
+                "D2_SCALE": 0.5,
+                "RPN_ANCHOR_SIZES": [32, 64, 128, 256, 512],
+                "RPN_ASPECT_RATIOS": [0.5, 1.0, 2.0],
+                "RPN_NMS_PRE": 2000,
+                "RPN_MAX_PER_IMG": 2000,
+                "RPN_NMS_THRESH": 0.8,
+                "RCNN_SCORE_THRESH": 0.05,
+                "RCNN_NMS_THRESH": 0.1,
+                "RCNN_MAX_PER_IMG": 2000,
+                "PATCH_MERGE_NMS_THRESH": 0.4,
+                "TRAIN_LABEL_SOURCE": "matched_gt",  # matched_gt | pred
+                "ADD_GTBOX_TO_PROPOSAL_IN_TRAIN": True,
+            },
+            # Object-class channel order of MODEL.PRETRAINED_DETECTOR.  The
+            # project itself always stores background at channel zero; keep
+            # this default to avoid changing custom/internal checkpoints.
+            "PRETRAINED_DETECTOR_CLASS_ORDER": "background_first",
             "BACKBONE": {
                 "NAME": "resnet_backbone",
                 "OUT_CHANNELS": 256,
@@ -70,6 +94,10 @@ def get_default_cfg():
                 "PREDICT_USE_BIAS": False,
                 "BIAS_LAMBDA": 0.0,
                 "REQUIRE_BOX_OVERLAP": False,
+                # sgcls only: labels supplied to Semantic Filter and the pair
+                # proposal filter at evaluation.  "pred" is task-faithful;
+                # "gt" reproduces the original SGG-Toolkit filtering path.
+                "SGCLS_FILTER_LABEL_SOURCE": "pred",  # pred | gt
                 "PREDICTOR": "UNIMPLEMENTED",
                 "CONTEXT_HIDDEN_DIM": 512,
                 "CONTEXT_POOLING_DIM": 256,
@@ -120,10 +148,15 @@ def get_default_cfg():
                 "TAIL_AWARE_POS_SAMPLING": False,
                 "TAIL_AWARE_POS_ALPHA": 0.5,
                 "TAIL_AWARE_POS_MIN_COUNT": 1.0,
-                "TEST_FILTER_METHOD": "NONE",
+                # A dense all-pairs relation graph is not a supported runtime
+                # mode for STAR: large OBB images can make it quadratic in the
+                # number of entities before RPCM starts. Every task config
+                # must choose PPG, PPN or RSGP explicitly; PPG is the safe
+                # legacy default.
+                "TEST_FILTER_METHOD": "PPG",
                 "SEMA_F_ENABLED": False,
                 "SEMA_F_PATH": "pretrained/SF_list_support.json",
-                "PPG_ENABLED": False,
+                "PPG_ENABLED": True,
                 "PPG_PAIR_THRESHOLD": 10000,
                 "PPG_TOPK": 10000,
                 "TEST_FILTER_TOPK": 10000,
@@ -138,6 +171,30 @@ def get_default_cfg():
                 "PPN_PAIR_THRESHOLD": 10000,
                 "PPN_TOPK": 10000,
                 "PPN_CHUNK_SIZE": 200000,
+                "RSGP_ENABLED": False,
+                "RSGP_MODE": "HYBRID",  # RS_ONLY | PPN_GRAPH | HYBRID
+                "RSGP_THRESHOLD": 10000,
+                "RSGP_TOPK": 10000,
+                "RSGP_CHUNK_SIZE": 200000,
+                "RSGP_PPG_PROTECTED_TOPK": 7000,
+                "RSGP_PPN_POOL_TOPK": 12000,
+                "RSGP_RS_POOL_TOPK": 12000,
+                "RSGP_MAX_OUT_DEGREE": 96,
+                "RSGP_MAX_IN_DEGREE": 96,
+                "RSGP_RELAXED_MAX_DEGREE": 128,
+                "RSGP_LABEL_PAIR_QUOTA": 800,
+                "RSGP_RELAXED_LABEL_PAIR_QUOTA": 1200,
+                "RSGP_W_PPG": 1.0,
+                "RSGP_W_PPN": 0.35,
+                "RSGP_W_GEOM": 0.35,
+                "RSGP_W_ANCHOR": 0.25,
+                "RSGP_W_TOPO": 0.20,
+                "RSGP_W_TAIL": 0.15,
+                "RSGP_W_DEGREE": 0.15,
+                "RSGP_ANCHOR_CLASSES": "apron,truck_parking,car_parking,dock,runway,taxiway,breakwater,goods_yard",
+                "RSGP_VEHICLE_CLASSES": "airplane,aircraft,vehicle,car,truck,ship,boat,bus,van",
+                "RSGP_NETWORK_CLASSES": "tower,lattice_tower,substation,genset,transmission_line,power_line,line,pole",
+                "RSGP_TAIL_PREDICATES": [7, 14, 20, 24, 25, 28, 31, 33, 36, 38, 39, 41, 53, 56, 58],
                 "RPCM_LEGACY_FILTER_FLOW": False,
                 "RPCM_LEGACY_UNION_BOX": False,
                 "GRAPH_TOPK": 10000,

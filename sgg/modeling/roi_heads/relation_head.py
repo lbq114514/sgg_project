@@ -9,6 +9,7 @@ from torch import nn
 from sgg.modeling.roi_heads.ppg import PairProposalGenerator
 from sgg.modeling.roi_heads.pair_proposal_network import PairProposalNetworkFilter
 from sgg.modeling.roi_heads.pair_graph_builder import PairGraphBuilder
+from sgg.modeling.roi_heads.rsgp import RemoteSensingGraphProposalFilter
 from sgg.modeling.roi_heads.relation_inference import make_roi_relation_post_processor
 from sgg.modeling.roi_heads.relation_loss import make_roi_relation_loss_evaluator
 from sgg.modeling.roi_heads.relation_sampling import make_roi_relation_samp_processor
@@ -30,6 +31,16 @@ def _to_onehot_logits(labels: torch.Tensor, num_classes: int, fill: float = 1000
         row_idx = torch.arange(labels.numel(), device=labels.device)
         logits[row_idx, labels.long()] = fill
     return logits
+
+
+def _normalize_sgcls_filter_label_source(value: object) -> str:
+    source = str(value).strip().lower()
+    if source not in {"pred", "gt"}:
+        raise ValueError(
+            "MODEL.ROI_RELATION_HEAD.SGCLS_FILTER_LABEL_SOURCE must be 'pred' or 'gt', "
+            f"got {value!r}."
+        )
+    return source
 
 
 class ROIRelationHead(nn.Module):
@@ -59,16 +70,28 @@ class ROIRelationHead(nn.Module):
         self.post_processor = make_roi_relation_post_processor(cfg)
         self.loss_evaluator = make_roi_relation_loss_evaluator(cfg)
         self.samp_processor = make_roi_relation_samp_processor(cfg)
-        filter_method = str(cfg["MODEL"]["ROI_RELATION_HEAD"].get("TEST_FILTER_METHOD", "NONE")).upper()
+        filter_method = str(cfg["MODEL"]["ROI_RELATION_HEAD"].get("TEST_FILTER_METHOD", "PPG")).upper()
+        supported_filters = {"PPG", "PPN", "RSGP"}
+        if filter_method not in supported_filters:
+            raise ValueError(
+                "MODEL.ROI_RELATION_HEAD.TEST_FILTER_METHOD must be one of "
+                f"{sorted(supported_filters)} for STAR; got {filter_method!r}. "
+                "The unfiltered all-pairs graph is disabled to prevent OOM."
+            )
         self.filter_method = filter_method
-        self.ppg = (
-            PairProposalNetworkFilter(cfg)
-            if filter_method == "PPN"
-            else PairProposalGenerator(cfg)
-        )
+        if filter_method == "RSGP":
+            self.ppg = RemoteSensingGraphProposalFilter(cfg)
+        elif filter_method == "PPN":
+            self.ppg = PairProposalNetworkFilter(cfg)
+        else:
+            self.ppg = PairProposalGenerator(cfg)
         self.sema_filter = SemanticPairFilter(cfg)
         rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
         self.type = cfg.get("TYPE", "CV")
+        self.task = str(cfg["MODEL"].get("TASK", "sgdet")).lower()
+        self.sgcls_filter_label_source = _normalize_sgcls_filter_label_source(
+            rel_cfg.get("SGCLS_FILTER_LABEL_SOURCE", "pred")
+        )
         self.use_union_box = bool(rel_cfg.get("PREDICT_USE_VISION", True))
         self.use_gt_box = bool(rel_cfg.get("USE_GT_BOX", False))
         self.use_gt_object_label = bool(rel_cfg.get("USE_GT_OBJECT_LABEL", False))
@@ -105,6 +128,69 @@ class ROIRelationHead(nn.Module):
             elif proposal.has_field("pred_logits"):
                 refine_logits.append(proposal.get_field("pred_logits"))
         return refine_logits if refine_logits else None
+
+    def _filter_labels_for_proposal(self, proposal):
+        """Select semantic/proposal-filter labels without changing predictor inputs.
+
+        The original SGG-Toolkit sgcls detector leaves ``proposal.labels`` as
+        GT labels even though it attaches predicted labels separately.  The
+        current project keeps predicted labels in that field for standard
+        sgcls.  This method supports both filtering protocols while retaining
+        ``pred_labels``/``predict_logits`` for the relation predictor.
+        """
+        if not proposal.has_field("labels"):
+            return None, "missing"
+        predicted_or_default = proposal.get_field("labels").long()
+        if self.task != "sgcls" or self.sgcls_filter_label_source == "pred":
+            return predicted_or_default, "pred"
+        if proposal.has_field("gt_labels"):
+            return proposal.get_field("gt_labels").long(), "gt"
+        # Keep evaluation robust for externally constructed proposals while
+        # making the missing legacy field visible in result diagnostics.
+        return predicted_or_default, "pred_fallback_missing_gt"
+
+    def _filter_test_pairs_for_proposal(self, proposal, pair_idx: torch.Tensor) -> torch.Tensor:
+        """Apply semantic and learned pair filters under the selected label source."""
+        filter_labels, resolved_source = self._filter_labels_for_proposal(proposal)
+        proposal.add_field("filter_label_source", resolved_source)
+        if filter_labels is None:
+            proposal.add_field("sema_rel_pair_idxs", pair_idx)
+            proposal.add_field("final_rel_pair_idxs", pair_idx)
+            proposal.add_field("pruned_rel_pair_idxs", pair_idx)
+            return pair_idx
+
+        proposal.add_field("filter_labels", filter_labels)
+        if self.sema_filter.enabled:
+            pair_idx = self.sema_filter.filter_pairs(pair_idx, filter_labels)
+        sema_pair_idx = pair_idx
+        proposal.add_field("sema_rel_pair_idxs", sema_pair_idx)
+
+        # PPG, PPN and RSGP all consume proposal.labels.  Temporarily expose
+        # the selected filter labels only for their scoring path, then restore
+        # the standard sgcls predicted labels used by the predictor/postprocess.
+        original_labels = proposal.get_field("labels")
+        swap_labels = filter_labels.data_ptr() != original_labels.data_ptr()
+        if swap_labels:
+            proposal.add_field("labels", filter_labels)
+        try:
+            if (
+                self.legacy_filter_flow
+                and self.filter_method == "RANDOM_FILTER"
+                and sema_pair_idx.size(0) > self.ppg.threshold
+            ):
+                rand_idx = torch.randperm(sema_pair_idx.size(0), device=sema_pair_idx.device)
+                filtered_pair_idx = sema_pair_idx[rand_idx[: self.ppg.topk]]
+            elif self.ppg.filter_method in {"PPG", "PPN", "RSGP"}:
+                filtered_pair_idx = self.ppg.filter_pairs(proposal, sema_pair_idx)
+            else:  # Constructor validates this; keep failure local if a filter mutates itself.
+                raise RuntimeError(f"Unsupported active pair filter {self.ppg.filter_method!r}")
+        finally:
+            if swap_labels:
+                proposal.add_field("labels", original_labels)
+
+        proposal.add_field("final_rel_pair_idxs", filtered_pair_idx)
+        proposal.add_field("pruned_rel_pair_idxs", filtered_pair_idx)
+        return filtered_pair_idx
 
     def forward(
         self,
@@ -148,28 +234,10 @@ class ROIRelationHead(nn.Module):
                 rel_pair_idxs = self.samp_processor.prepare_test_pairs(self._feature_device(features), proposals)
                 for proposal, pair_idx in zip(proposals, rel_pair_idxs):
                     proposal.add_field("base_rel_pair_idxs", pair_idx)
-                filtered_pair_idxs = []
-                for proposal, pair_idx in zip(proposals, rel_pair_idxs):
-                    if self.sema_filter.enabled and proposal.has_field("labels"):
-                        pair_idx = self.sema_filter.filter_pairs(pair_idx, proposal.get_field("labels").long())
-                    sema_pair_idx = pair_idx
-                    proposal.add_field("sema_rel_pair_idxs", sema_pair_idx)
-
-                    if (
-                        self.legacy_filter_flow
-                        and self.filter_method == "RANDOM_FILTER"
-                        and sema_pair_idx.size(0) > self.ppg.threshold
-                    ):
-                        rand_idx = torch.randperm(sema_pair_idx.size(0), device=sema_pair_idx.device)
-                        filtered_pair_idx = sema_pair_idx[rand_idx[: self.ppg.topk]]
-                    elif self.ppg.enabled and self.ppg.filter_method in {"PPG", "PPN"}:
-                        filtered_pair_idx = self.ppg.filter_pairs(proposal, sema_pair_idx)
-                    else:
-                        filtered_pair_idx = sema_pair_idx
-                    filtered_pair_idxs.append(filtered_pair_idx)
-                    proposal.add_field("final_rel_pair_idxs", filtered_pair_idx)
-                    proposal.add_field("pruned_rel_pair_idxs", filtered_pair_idx)
-                rel_pair_idxs = filtered_pair_idxs
+                rel_pair_idxs = [
+                    self._filter_test_pairs_for_proposal(proposal, pair_idx)
+                    for proposal, pair_idx in zip(proposals, rel_pair_idxs)
+                ]
 
         if self.use_gt_box and self.use_gt_object_label and (
             self.predictor_name in {"RPCM", "RPCM_LEGACY", "LEGACY_RPCM"} or self.use_typed_pair_graph

@@ -44,7 +44,15 @@ def main() -> None:
 
     left_flat: dict[str, dict] = {}
     right_flat: dict[str, dict] = {}
-    for section in ("image", "target_boxes", "target_labels", "target_relations", "hooks", "result_fields"):
+    for section in (
+        "image",
+        "target_boxes",
+        "target_labels",
+        "target_relations",
+        "hooks",
+        "object_fields",
+        "result_fields",
+    ):
         flatten_digests(section, left.get(section), left_flat)
         flatten_digests(section, right.get(section), right_flat)
 

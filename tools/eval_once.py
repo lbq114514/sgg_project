@@ -15,6 +15,12 @@ if str(ROOT_DIR) not in sys.path:
 from sgg.config.defaults import get_default_cfg
 from sgg.data.build import build_dataloaders, build_datasets
 from sgg.engine import Trainer
+from sgg.modeling.detectors.class_channel_order import (
+    BACKGROUND_LAST,
+    INTERNAL_DETECTOR_CLASS_ORDER,
+    is_detector_classifier_key,
+    reorder_detector_classifier_rows,
+)
 from sgg.modeling.detectors.scene_graph_detector import SceneGraphDetector
 
 
@@ -63,7 +69,7 @@ def parse_args():
     )
     parser.add_argument(
         "--filter-method",
-        choices=("NONE", "PPG", "PPN"),
+        choices=("PPG", "PPN", "RSGP"),
         default=None,
         help="Optional runtime override for the configured pair filter.",
     )
@@ -139,6 +145,24 @@ def _legacy_rpcm_key_candidates(key: str) -> list[str]:
 
 def load_model_only_checkpoint(trainer: Trainer, path: str, *, legacy_rpcm: bool = False):
     ckpt = torch.load(path, map_location=trainer.device)
+    checkpoint_class_order = (
+        ckpt.get("detector_class_channel_order") if isinstance(ckpt, dict) else None
+    )
+    if checkpoint_class_order is None:
+        legacy_note = (
+            " Applying original-RPCM legacy remaps, including "
+            "background_last->background_first for detector classifiers."
+            if legacy_rpcm
+            else ""
+        )
+        print(
+            "Checkpoint detector class-channel order: <unmarked>; loading unchanged as "
+            "background_first for backward compatibility. Migrate explicitly before using "
+            f"an old checkpoint for sgcls/sgdet if needed.{legacy_note}",
+            flush=True,
+        )
+    else:
+        print(f"Checkpoint detector class-channel order: {checkpoint_class_order}", flush=True)
     source = _checkpoint_state_dict(ckpt)
     if not isinstance(source, dict):
         raise TypeError(f"Checkpoint does not contain a model state_dict: {path}")
@@ -148,6 +172,7 @@ def load_model_only_checkpoint(trainer: Trainer, path: str, *, legacy_rpcm: bool
     remapped = {}
     skipped_shape = []
     used_source_keys = set()
+    reordered_detector_classifier = []
     for source_key, source_value in source.items():
         if source_key not in target:
             continue
@@ -161,7 +186,20 @@ def load_model_only_checkpoint(trainer: Trainer, path: str, *, legacy_rpcm: bool
                 )
             )
             continue
-        update[source_key] = source_value
+        value_to_load = source_value
+        # Original RPCM checkpoints may carry both the mmrotate detector key
+        # (``roi_head...fc_cls``) and the old relation-model alias
+        # (``roi_heads.box.predictor.cls_score``).  The direct mmrotate key
+        # wins this loop, so it must receive the same background-last ->
+        # background-first conversion as the alias path below.
+        if legacy_rpcm and is_detector_classifier_key(source_key):
+            value_to_load = reorder_detector_classifier_rows(
+                source_value,
+                source_order=BACKGROUND_LAST,
+                target_order=INTERNAL_DETECTOR_CLASS_ORDER,
+            )
+            reordered_detector_classifier.append((source_key, source_key))
+        update[source_key] = value_to_load
         used_source_keys.add(source_key)
 
     if legacy_rpcm:
@@ -183,7 +221,18 @@ def load_model_only_checkpoint(trainer: Trainer, path: str, *, legacy_rpcm: bool
                         )
                     )
                     continue
-                update[target_key] = source_value
+                value_to_load = source_value
+                if (
+                    source_key.startswith("roi_heads.box.predictor.cls_score.")
+                    and is_detector_classifier_key(target_key)
+                ):
+                    value_to_load = reorder_detector_classifier_rows(
+                        source_value,
+                        source_order=BACKGROUND_LAST,
+                        target_order=INTERNAL_DETECTOR_CLASS_ORDER,
+                    )
+                    reordered_detector_classifier.append((source_key, target_key))
+                update[target_key] = value_to_load
                 loaded_targets.append(target_key)
             if loaded_targets:
                 used_source_keys.add(source_key)
@@ -220,6 +269,7 @@ def load_model_only_checkpoint(trainer: Trainer, path: str, *, legacy_rpcm: bool
             "unused_source": len(unused_source),
             "skipped_shape": len(skipped_shape),
             "mode": "legacy-rpcm" if legacy_rpcm else "model-only",
+            "reordered_detector_classifier": len(reordered_detector_classifier),
         },
         flush=True,
     )
@@ -231,6 +281,12 @@ def load_model_only_checkpoint(trainer: Trainer, path: str, *, legacy_rpcm: bool
         print("Unused source keys sample:", unused_source[:30], flush=True)
     if skipped_shape:
         print("Skipped shape mismatch sample:", skipped_shape[:20], flush=True)
+    if reordered_detector_classifier:
+        print(
+            "Legacy detector classifier rows reordered (background_last->background_first):",
+            reordered_detector_classifier,
+            flush=True,
+        )
     return ckpt
 
 
@@ -243,22 +299,30 @@ def main():
 
     rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
     if args.filter_method is not None:
-        rel_cfg["TEST_FILTER_METHOD"] = args.filter_method
+        rel_cfg["TEST_FILTER_METHOD"] = str(args.filter_method).upper()
     if args.pair_filter_checkpoint:
-        if str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper() == "PPN":
+        method = str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper()
+        if method == "PPN":
             rel_cfg["PPN_MODEL_PATH"] = args.pair_filter_checkpoint
-        elif str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper() == "PPG":
+        elif method == "PPG":
             rel_cfg["PPG_MODEL_PATH_OBB"] = args.pair_filter_checkpoint
+        elif method == "RSGP":
+            rel_cfg["PPN_MODEL_PATH"] = args.pair_filter_checkpoint
         else:
-            raise ValueError("--pair-filter-checkpoint requires --filter-method PPN or PPG")
+            raise ValueError("--pair-filter-checkpoint requires --filter-method PPN, PPG or RSGP")
     filter_method = str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper()
-    filter_path = (
-        rel_cfg.get("PPN_MODEL_PATH", "")
-        if filter_method == "PPN"
-        else rel_cfg.get("PPG_MODEL_PATH_OBB", "")
-        if filter_method == "PPG"
-        else ""
-    )
+    if filter_method == "PPN":
+        filter_path = rel_cfg.get("PPN_MODEL_PATH", "")
+    elif filter_method == "PPG":
+        filter_path = rel_cfg.get("PPG_MODEL_PATH_OBB", "")
+    elif filter_method == "RSGP":
+        filter_path = (
+            f"ppg={rel_cfg.get('PPG_MODEL_PATH_OBB', '')}, "
+            f"ppn={rel_cfg.get('PPN_MODEL_PATH', '')}, "
+            f"mode={rel_cfg.get('RSGP_MODE', 'HYBRID')}"
+        )
+    else:
+        filter_path = ""
     print(
         f"Resolved pair filter: method={filter_method}, checkpoint={filter_path or '<none>'}",
         flush=True,

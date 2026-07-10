@@ -2268,6 +2268,26 @@ class RPCMLegacy(nn.Module):
         self.bias_lambda_test = float(
             _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_BIAS_LAMBDA_TEST", default=0.5)
         )
+        tail_aux_predicates = [
+            int(v)
+            for v in _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_TAIL_AUX_PREDICATES",
+                default=[],
+            )
+            if 0 < int(v) < self.num_rel_classes
+        ]
+        self.tail_aux_enabled = bool(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_TAIL_AUX_ENABLED", default=False)
+        ) and len(tail_aux_predicates) > 0
+        self.tail_aux_loss_weight = float(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_TAIL_AUX_LOSS_WEIGHT", default=0.2)
+        )
+        self.tail_aux_logit_max_weight = float(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_TAIL_AUX_LOGIT_MAX_WEIGHT", default=0.3)
+        )
 
         self.post_emb = nn.Linear(in_channels, self.mlp_dim * 2)
         self.pairwise_feature_extractor = PairwiseFeatureExtractor(cfg, in_channels)
@@ -2287,6 +2307,48 @@ class RPCMLegacy(nn.Module):
             self.gcn_ent2rel.append(_LegacyGraphConvolutionLayerCollect(self.graph_dim, self.graph_dim))
             self.gcn_rel2rel.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
 
+        if self.tail_aux_enabled:
+            tail_aux_hidden_dim = int(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_TAIL_AUX_HIDDEN_DIM", default=512)
+            )
+            tail_aux_dropout = float(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_TAIL_AUX_DROPOUT", default=0.1)
+            )
+            self.register_buffer(
+                "tail_aux_predicates",
+                torch.as_tensor(sorted(set(tail_aux_predicates)), dtype=torch.long),
+                persistent=True,
+            )
+            self.tail_aux_head = nn.Sequential(
+                nn.LayerNorm(self.mlp_dim),
+                nn.Linear(self.mlp_dim, tail_aux_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(tail_aux_dropout),
+                nn.Linear(tail_aux_hidden_dim, len(self.tail_aux_predicates)),
+            )
+            init_scale = float(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_TAIL_AUX_LOGIT_INIT", default=0.0)
+            )
+            self.tail_aux_logit_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
+            predicate_counts = _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICATE_COUNTS", default=[])
+            counts = torch.ones((self.num_rel_classes,), dtype=torch.float32)
+            if predicate_counts:
+                n = min(len(predicate_counts), self.num_rel_classes)
+                counts[:n] = torch.as_tensor(predicate_counts[:n], dtype=torch.float32).clamp(min=1.0)
+            fg_total = counts[1:].sum().clamp(min=1.0)
+            selected_counts = counts[self.tail_aux_predicates].clamp(min=1.0)
+            pos_weight = (fg_total / selected_counts).clamp(min=1.0, max=20.0)
+            self.register_buffer("tail_aux_pos_weight", pos_weight, persistent=False)
+            print(
+                "[RPCM_LEGACY] tail auxiliary enabled: "
+                f"predicates={self.tail_aux_predicates.tolist()}, "
+                f"loss_weight={self.tail_aux_loss_weight}, "
+                f"logit_max_weight={self.tail_aux_logit_max_weight}",
+                flush=True,
+            )
+        else:
+            self.register_buffer("tail_aux_predicates", torch.zeros((0,), dtype=torch.long), persistent=True)
+
         proto_embed_dim = int(
             _cfg_get(
                 cfg,
@@ -2298,6 +2360,16 @@ class RPCMLegacy(nn.Module):
         )
         if proto_embed_dim <= 0:
             proto_embed_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "EMBED_DIM", default=300))
+        semantic_glove_path = str(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_PROTO_GLOVE_PATH",
+                default="",
+            )
+            or _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")
+        )
         self.pos_embed = nn.Sequential(
             nn.Linear(9, 32),
             nn.BatchNorm1d(32, momentum=0.001),
@@ -2305,7 +2377,25 @@ class RPCMLegacy(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.obj_embed1 = nn.Embedding(self.num_obj_classes, proto_embed_dim)
+        obj_class_names = list(_cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "CLASS_NAMES", default=[]))
+        if len(obj_class_names) < self.num_obj_classes:
+            obj_class_names += [
+                f"class_{idx}" for idx in range(len(obj_class_names), self.num_obj_classes)
+            ]
+        obj_embed_vecs, obj_embed_mask, obj_text_diag = _build_semantic_prototypes(
+            obj_class_names[: self.num_obj_classes],
+            proto_embed_dim,
+            semantic_glove_path,
+            proto_embed_dim,
+            str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_PROTO_INIT", default="semantic")),
+            modifier_aware=False,
+        )
+        with torch.no_grad():
+            valid = obj_embed_mask[: self.num_obj_classes]
+            if valid.any():
+                self.obj_embed1.weight[valid] = obj_embed_vecs[: self.num_obj_classes][valid]
         self.lin_obj_cyx = nn.Linear(in_channels + proto_embed_dim + 128, 512)
+        self.out_obj = nn.Linear(512, self.num_obj_classes)
         if bool(
             _cfg_get(
                 cfg,
@@ -2329,16 +2419,6 @@ class RPCMLegacy(nn.Module):
             self.relation_names = self.relation_names + [
                 f"relation_{idx}" for idx in range(len(self.relation_names), self.num_rel_classes)
             ]
-        semantic_glove_path = str(
-            _cfg_get(
-                cfg,
-                "MODEL",
-                "ROI_RELATION_HEAD",
-                "RPCM_PROTO_GLOVE_PATH",
-                default="",
-            )
-            or _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")
-        )
         rel_glove_init, rel_text_diag = _build_prototype_text_init(
             self.relation_names,
             semantic_glove_path,
@@ -2372,7 +2452,8 @@ class RPCMLegacy(nn.Module):
         print(
             "[RPCM_LEGACY] "
             f"graph_dim={self.graph_dim}, mlp_dim={self.mlp_dim}, feat_update_step={self.feat_update_step}, "
-            f"glove_missing={rel_text_diag.get('missing_predicates', [])}",
+            f"glove_missing={rel_text_diag.get('missing_predicates', [])}, "
+            f"obj_glove_missing={obj_text_diag.get('missing_predicates', [])}",
             flush=True,
         )
 
@@ -2428,15 +2509,45 @@ class RPCMLegacy(nn.Module):
             entity_map.to(dtype=dtype),
         )
 
-    def _refine_logits(self, proposals: Sequence, device: torch.device) -> list[torch.Tensor]:
-        logits = []
-        for proposal in proposals:
-            if proposal.has_field("predict_logits"):
-                logits.append(proposal.get_field("predict_logits"))
-                continue
-            labels = proposal.get_field("labels").long().clamp(min=0, max=self.num_obj_classes - 1)
-            logits.append(F.one_hot(labels, num_classes=self.num_obj_classes).float().to(device))
-        return logits
+    def _refine_logits(self, obj_features: torch.Tensor, proposals: Sequence) -> list[torch.Tensor]:
+        if obj_features.numel() == 0:
+            return [
+                proposal.bbox.new_zeros((len(proposal), self.num_obj_classes))
+                for proposal in proposals
+            ]
+
+        if bool(_cfg_get(self.cfg, "MODEL", "ROI_RELATION_HEAD", "USE_GT_OBJECT_LABEL", default=False)):
+            obj_labels = torch.cat(
+                [proposal.get_field("labels").long().to(obj_features.device) for proposal in proposals],
+                dim=0,
+            ).clamp(min=0, max=self.num_obj_classes - 1)
+            obj_embed = self.obj_embed1(obj_labels)
+        else:
+            obj_logits = torch.cat(
+                [proposal.get_field("predict_logits").to(obj_features.device) for proposal in proposals],
+                dim=0,
+            ).detach()
+            obj_embed = F.softmax(obj_logits[:, : self.num_obj_classes], dim=1) @ self.obj_embed1.weight
+
+        pos_embed = self.pos_embed(_orig_encode_box_info(proposals).to(obj_features.device))
+        obj_pre_rep = self.lin_obj_cyx(torch.cat([obj_features, obj_embed, pos_embed], dim=-1))
+        if str(_cfg_get(self.cfg, "MODEL", "TASK", default="")).lower() == "predcls":
+            labels = torch.cat(
+                [proposal.get_field("labels").long().to(obj_features.device) for proposal in proposals],
+                dim=0,
+            ).clamp(min=0, max=self.num_obj_classes - 1)
+            refine_logits = F.one_hot(labels, num_classes=self.num_obj_classes).float()
+        else:
+            refine_logits = self.out_obj(obj_pre_rep)
+
+        num_objs = [len(proposal) for proposal in proposals]
+        return list(refine_logits.split(num_objs, dim=0))
+
+    def _tail_aux_targets(self, labels: torch.Tensor) -> torch.Tensor:
+        if labels.numel() == 0 or self.tail_aux_predicates.numel() == 0:
+            return labels.new_zeros((labels.numel(), int(self.tail_aux_predicates.numel())), dtype=torch.float32)
+        predicate_ids = self.tail_aux_predicates.to(device=labels.device)
+        return (labels.long().unsqueeze(1) == predicate_ids.unsqueeze(0)).to(dtype=torch.float32)
 
     def forward(
         self,
@@ -2509,10 +2620,26 @@ class RPCMLegacy(nn.Module):
                 bias_lambda = self.bias_lambda_train if self.training else self.bias_lambda_test
                 relation_logits = relation_logits + bias_lambda * bias_logits
 
+        add_losses = dict(proto_losses)
+        if self.tail_aux_enabled and rel_hidden.numel() > 0:
+            tail_aux_logits = self.tail_aux_head(rel_hidden)
+            predicate_ids = self.tail_aux_predicates.to(device=relation_logits.device)
+            scale = torch.tanh(self.tail_aux_logit_scale) * self.tail_aux_logit_max_weight
+            relation_logits = relation_logits.clone()
+            relation_logits[:, predicate_ids] = relation_logits[:, predicate_ids] + scale * tail_aux_logits
+            if self.training and flat_rel_labels is not None and flat_rel_labels.numel() > 0:
+                tail_targets = self._tail_aux_targets(flat_rel_labels.to(relation_logits.device))
+                tail_loss = F.binary_cross_entropy_with_logits(
+                    tail_aux_logits,
+                    tail_targets,
+                    pos_weight=self.tail_aux_pos_weight.to(relation_logits.device),
+                )
+                add_losses["loss_tail_aux"] = tail_loss * self.tail_aux_loss_weight
+
         num_rels = [pair_idx.size(0) for pair_idx in rel_pair_idxs]
         relation_logits = list(relation_logits.split(num_rels, dim=0)) if num_rels else []
-        refine_logits = self._refine_logits(proposals, rel_hidden.device)
-        return relation_logits, refine_logits, dict(proto_losses)
+        refine_logits = self._refine_logits(obj_feats[-1], proposals)
+        return relation_logits, refine_logits, add_losses
 
 
 class RPCMOriginalLegacy(RPCMLegacy):

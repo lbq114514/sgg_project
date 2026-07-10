@@ -255,8 +255,10 @@ class PairProposalNetworkFilter(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
-        self.enabled = bool(rel_cfg.get("PPN_ENABLED", False))
-        self.filter_method = str(rel_cfg.get("TEST_FILTER_METHOD", "NONE")).upper()
+        self.filter_method = str(rel_cfg.get("TEST_FILTER_METHOD", "PPG")).upper()
+        # TEST_FILTER_METHOD is the single source of truth.  PPN_ENABLED remains
+        # only as a legacy config key, so scripts no longer need to set both.
+        self.enabled = self.filter_method == "PPN"
         self.model_path = Path(
             str(rel_cfg.get("PPN_MODEL_PATH", "outputs/star_pair_proposal_network/model_best.pth"))
         )
@@ -272,7 +274,7 @@ class PairProposalNetworkFilter(nn.Module):
         self._load_weights()
 
     def _load_weights(self) -> None:
-        if not self.enabled or self.filter_method != "PPN":
+        if self.filter_method != "PPN":
             return
         if not self.model_path.is_file():
             print(f"PPN checkpoint not found: {self.model_path}", flush=True)
@@ -306,7 +308,7 @@ class PairProposalNetworkFilter(nn.Module):
 
     def should_filter(self, pair_idx: torch.Tensor) -> bool:
         return (
-            self.enabled and self.filter_method == "PPN" and self.loaded
+            self.filter_method == "PPN" and self.loaded
             and self.model is not None and pair_idx.size(0) > self.threshold
         )
 

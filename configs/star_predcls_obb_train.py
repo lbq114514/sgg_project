@@ -9,6 +9,21 @@ DATA_ROOT = os.environ.get(
 )
 
 
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, str(default)))
+
+
+def _env_list_int(name: str, default):
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return list(default)
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
 cfg = get_default_cfg()
 cfg["MODEL"]["TASK"] = "predcls"
 cfg["MODEL"]["BOX_MODE"] = "obb"
@@ -49,16 +64,34 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["BATCH_SIZE_PER_IMAGE"] = 512
 cfg["MODEL"]["ROI_RELATION_HEAD"]["POSITIVE_FRACTION"] = 0.25
 cfg["MODEL"]["ROI_RELATION_HEAD"]["MAX_TEST_PAIRS_PER_IMAGE"] = 0
 cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_PAIR_SAMPLER"] = "ALL"
-cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_FILTER_METHOD"] = "PPG"
+_filter_method = os.environ.get(
+    "FILTER_METHOD",
+    os.environ.get("TEST_FILTER_METHOD", "PPG"),
+).upper()
+if _filter_method not in {"PPG", "PPN", "RSGP"}:
+    raise ValueError(
+        "FILTER_METHOD must be PPG, PPN, or RSGP; "
+        "unfiltered all-pairs relation graphs are disabled for STAR."
+    )
+cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_FILTER_METHOD"] = _filter_method
+# This setting is only consumed by TASK="sgcls".  Keep the task-faithful
+# predicted-label behavior as the default for future sgcls configs.
+cfg["MODEL"]["ROI_RELATION_HEAD"]["SGCLS_FILTER_LABEL_SOURCE"] = os.environ.get(
+    "SGCLS_FILTER_LABEL_SOURCE", "pred"
+).lower()
 cfg["MODEL"]["ROI_RELATION_HEAD"]["SEMA_F_ENABLED"] = True
 cfg["MODEL"]["ROI_RELATION_HEAD"]["SEMA_F_PATH"] = os.environ.get(
     "SEMA_F_PATH",
-    "/home/ubuntu/research/ssd/RPCM/maskrcnn_benchmark/modeling/roi_heads/relation_head/SF_list.json",
+    "pretrained/SF_list_support.json",
 )
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_ENABLED"] = True
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_PAIR_THRESHOLD"] = 10000
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_TOPK"] = 10000
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_CHUNK_SIZE"] = 1000000
+# Legacy mirror fields only. Runtime filter selection is controlled by
+# TEST_FILTER_METHOD/FILTER_METHOD.
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_ENABLED"] = _filter_method == "PPG"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_ENABLED"] = _filter_method == "PPN"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ENABLED"] = _filter_method == "RSGP"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_PAIR_THRESHOLD"] = _env_int("PPG_PAIR_THRESHOLD", 10000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_TOPK"] = _env_int("PPG_TOPK", 10000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_CHUNK_SIZE"] = _env_int("PPG_CHUNK_SIZE", 1000000)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_BASE_PAIR_KEEP_TOPK"] = 0
 cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_SUBGRAPH_COMPLETION_TOPK"] = 0
 cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_PAIRNESS_TOPK"] = 0
@@ -66,13 +99,62 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_PAIRNESS_COMPLETION_TOPK"] = 0
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_ENCODING_DIM"] = 25
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_HIDDEN_DIM1"] = 50
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_HIDDEN_DIM2"] = 50
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_MODEL_PATH_OBB"] = "pretrained/STAR_OBB.pth"
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_MODEL_PATH_HBB"] = "pretrained/STAR_HBB.pth"
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_ENABLED"] = False
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_MODEL_PATH"] = "pretrained/PPN_OBB.pth"
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_PAIR_THRESHOLD"] = 10000
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_TOPK"] = 10000
-cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_CHUNK_SIZE"] = 200000
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_MODEL_PATH_OBB"] = os.environ.get(
+    "PPG_MODEL_PATH_OBB",
+    "pretrained/STAR_OBB.pth",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_MODEL_PATH_HBB"] = os.environ.get(
+    "PPG_MODEL_PATH_HBB",
+    "pretrained/STAR_HBB.pth",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_MODEL_PATH"] = os.environ.get(
+    "PPN_MODEL_PATH",
+    "pretrained/PPN_OBB.pth",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_PAIR_THRESHOLD"] = _env_int("PPN_PAIR_THRESHOLD", 10000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_TOPK"] = _env_int("PPN_TOPK", 10000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_CHUNK_SIZE"] = _env_int("PPN_CHUNK_SIZE", 200000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_MODE"] = os.environ.get("RSGP_MODE", "HYBRID").upper()
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_THRESHOLD"] = _env_int("RSGP_THRESHOLD", 10000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_TOPK"] = _env_int("RSGP_TOPK", 10000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_CHUNK_SIZE"] = _env_int("RSGP_CHUNK_SIZE", 200000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_PPG_PROTECTED_TOPK"] = _env_int(
+    "RSGP_PPG_PROTECTED_TOPK",
+    7000,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_PPN_POOL_TOPK"] = _env_int("RSGP_PPN_POOL_TOPK", 12000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_RS_POOL_TOPK"] = _env_int("RSGP_RS_POOL_TOPK", 12000)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_MAX_OUT_DEGREE"] = _env_int("RSGP_MAX_OUT_DEGREE", 96)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_MAX_IN_DEGREE"] = _env_int("RSGP_MAX_IN_DEGREE", 96)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_RELAXED_MAX_DEGREE"] = _env_int("RSGP_RELAXED_MAX_DEGREE", 128)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_LABEL_PAIR_QUOTA"] = _env_int("RSGP_LABEL_PAIR_QUOTA", 800)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_RELAXED_LABEL_PAIR_QUOTA"] = _env_int(
+    "RSGP_RELAXED_LABEL_PAIR_QUOTA",
+    1200,
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_PPG"] = _env_float("RSGP_W_PPG", 1.0)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_PPN"] = _env_float("RSGP_W_PPN", 0.35)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_GEOM"] = _env_float("RSGP_W_GEOM", 0.35)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_ANCHOR"] = _env_float("RSGP_W_ANCHOR", 0.25)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_TOPO"] = _env_float("RSGP_W_TOPO", 0.20)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_TAIL"] = _env_float("RSGP_W_TAIL", 0.15)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_DEGREE"] = _env_float("RSGP_W_DEGREE", 0.15)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ANCHOR_CLASSES"] = os.environ.get(
+    "RSGP_ANCHOR_CLASSES",
+    "apron,truck_parking,car_parking,dock,runway,taxiway,breakwater,goods_yard",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_VEHICLE_CLASSES"] = os.environ.get(
+    "RSGP_VEHICLE_CLASSES",
+    "airplane,aircraft,vehicle,car,truck,ship,boat,bus,van",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_NETWORK_CLASSES"] = os.environ.get(
+    "RSGP_NETWORK_CLASSES",
+    "tower,lattice_tower,substation,genset,transmission_line,power_line,line,pole",
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_TAIL_PREDICATES"] = _env_list_int(
+    "RSGP_TAIL_PREDICATES",
+    [7, 14, 20, 24, 25, 28, 31, 33, 36, 38, 39, 41, 53, 56, 58],
+)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PREDICATE_LOSS_TYPE"] = "ce"
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PREDICATE_AUX_LOGIT_ADJUST_WEIGHT"] = 0.0
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_MLP_DIM"] = 2048
@@ -125,6 +207,10 @@ cfg["MODEL"]["RPN_HEAD"] = {
     "USE_SIGMOID_CLS": True,
 }
 cfg["MODEL"]["PRETRAINED_DETECTOR"] = "pretrained/OBB_swin_L_OBD.pth"
+# The original mmrotate STAR OBB detector stores its background classifier
+# output in the last (48th) row.  SceneGraphDetector normalizes it to the
+# project's background-first convention while loading.
+cfg["MODEL"]["PRETRAINED_DETECTOR_CLASS_ORDER"] = "background_last"
 cfg["MODEL"]["ROI_EXTRACTOR"]["NAME"] = "rotated_roi_extractor"
 cfg["MODEL"]["ROI_EXTRACTOR"]["OUT_CHANNELS"] = 512
 cfg["MODEL"]["ROI_EXTRACTOR"]["FEATURE_KEY"] = "p2"
@@ -147,8 +233,8 @@ cfg["MODEL"]["ROI_BOX_HEAD"]["MLP_HEAD_DIM"] = 4096
 
 cfg["DATALOADER"]["BATCH_SIZE"] = 8
 cfg["DATALOADER"]["TRAIN_BATCH_SIZE"] = 16
-cfg["DATALOADER"]["VAL_BATCH_SIZE"] = int(os.environ.get("VAL_BATCH_SIZE", "1"))
-cfg["DATALOADER"]["TEST_BATCH_SIZE"] = int(os.environ.get("TEST_BATCH_SIZE", "1"))
+cfg["DATALOADER"]["VAL_BATCH_SIZE"] = int(os.environ.get("VAL_BATCH_SIZE", "2"))
+cfg["DATALOADER"]["TEST_BATCH_SIZE"] = int(os.environ.get("TEST_BATCH_SIZE", "2"))
 cfg["DATALOADER"]["NUM_WORKERS"] = 8
 cfg["DATALOADER"]["SIZE_DIVISIBLE"] = 32
 
@@ -163,7 +249,7 @@ cfg["SOLVER"]["WARMUP_ITERS"] = 500
 cfg["SOLVER"]["WARMUP_EPOCHS"] = 0
 cfg["SOLVER"]["WARMUP_FACTOR"] = 0.1
 cfg["SOLVER"]["WARMUP_METHOD"] = "linear"
-cfg["SOLVER"]["MAX_EPOCHS"] = int(os.environ.get("MAX_EPOCHS", "410"))
+cfg["SOLVER"]["MAX_EPOCHS"] = int(os.environ.get("MAX_EPOCHS", "300"))
 cfg["SOLVER"]["OUTPUT_DIR"] = os.environ.get("OUTPUT_DIR", "outputs/star_predcls_obb_train")
 cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "4"))
 cfg["SOLVER"]["VAL_PERIOD"] = int(os.environ.get("VAL_PERIOD", "4"))
@@ -173,7 +259,7 @@ cfg["SOLVER"]["PRINT_GRAD_FREQ"] = 0
 cfg["SOLVER"]["GRAD_NORM_CLIP"] = 5.0
 cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupMultiStepLR"
 cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "iter"
-cfg["SOLVER"]["STEPS"] = [12000, 18000]
+cfg["SOLVER"]["STEPS"] = [6000, 8500, 10000]
 cfg["SOLVER"]["GAMMA"] = 0.1
 cfg["SOLVER"]["SCHEDULE"]["MIN_LR_RATIO"] = 0.0
 cfg["SOLVER"]["SCHEDULE"]["EXP_GAMMA"] = 0.9999
