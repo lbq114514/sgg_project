@@ -6,18 +6,47 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-pyg}"
-CONFIG="${CONFIG:-configs/star_predcls_obb_train.py}"
-CHECKPOINT="${CHECKPOINT:-/home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth}"
 SPLIT="${SPLIT:-test}"
 DEVICE="${DEVICE:-cuda}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_eval_legacy}"
-LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/test.log}"
-OUTPUT_JSON="${OUTPUT_JSON:-${OUTPUT_DIR}/test_metrics.json}"
-FILTER_METHOD="${FILTER_METHOD:-PPG}"
+FILTER_METHOD="${FILTER_METHOD:-}"
 PAIR_FILTER_CHECKPOINT="${PAIR_FILTER_CHECKPOINT:-}"
-CHECKPOINT_LOAD_MODE="${CHECKPOINT_LOAD_MODE:-legacy-rpcm}"
+CHECKPOINT_LOAD_MODE="${CHECKPOINT_LOAD_MODE:-full}"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  CONFIG=... CHECKPOINT=... OUTPUT_DIR=... [options] bash scripts/eval_once.sh
+
+Required:
+  CONFIG       Python config used to build the model.
+  CHECKPOINT   Checkpoint to evaluate.
+  OUTPUT_DIR   Directory for test.log and test_metrics.json.
+
+Common options:
+  SPLIT=test|val                         default: test
+  DEVICE=cuda|cpu                        default: cuda
+  CHECKPOINT_LOAD_MODE=full|model-only|legacy-rpcm
+                                        default: full
+  FILTER_METHOD=PPG|PPN|RSGP             optional runtime override;
+                                        if omitted, the config decides.
+  PAIR_FILTER_CHECKPOINT=...             optional PPG/PPN checkpoint override.
+  LOG_FILE=...                           default: ${OUTPUT_DIR}/test.log
+  OUTPUT_JSON=...                        default: ${OUTPUT_DIR}/test_metrics.json
+
+This script intentionally has no default CONFIG/CHECKPOINT/OUTPUT_DIR to avoid
+silently evaluating a checkpoint with the wrong model config.
+EOF
+}
 
 cd "${ROOT_DIR}"
+
+if [[ -z "${CONFIG:-}" || -z "${CHECKPOINT:-}" || -z "${OUTPUT_DIR:-}" ]]; then
+  usage
+  exit 2
+fi
+
+LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/test.log}"
+OUTPUT_JSON="${OUTPUT_JSON:-${OUTPUT_DIR}/test_metrics.json}"
 
 if [[ ! -f "${CONFIG}" ]]; then
   echo "Config not found: ${CONFIG}" >&2
@@ -56,7 +85,8 @@ echo "Started evaluation with PID $!"
 echo "Config: ${CONFIG}"
 echo "Checkpoint: ${CHECKPOINT}"
 echo "Split: ${SPLIT}"
-echo "Filter: ${FILTER_METHOD}"
+echo "Filter override: ${FILTER_METHOD:-<config>}"
+echo "Pair filter checkpoint override: ${PAIR_FILTER_CHECKPOINT:-<config>}"
 echo "Load mode: ${CHECKPOINT_LOAD_MODE}"
 echo "Log: ${LOG_FILE}"
 echo "JSON: ${OUTPUT_JSON}"

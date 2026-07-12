@@ -53,6 +53,15 @@ cfg["MODEL"]["SGDET_COMPAT"].update(
             os.environ.get("PATCH_MERGE_NMS_THRESH", "0.4")
         ),
         "TRAIN_LABEL_SOURCE": os.environ.get("SGDET_TRAIN_LABEL_SOURCE", "matched_gt"),
+        # Match SGG-Toolkit/STAR's legacy sgdet protocol by default: detector
+        # boxes keep detector logits/pred_labels, while proposal.labels is set
+        # from detector-to-GT matching for pair filtering and relation sampling.
+        # Use SGDET_FILTER_LABEL_SOURCE=pred for strict predicted-label
+        # ablations.
+        "EVAL_LABEL_SOURCE": os.environ.get(
+            "SGDET_FILTER_LABEL_SOURCE",
+            os.environ.get("SGDET_EVAL_LABEL_SOURCE", "matched_gt"),
+        ),
         "ADD_GTBOX_TO_PROPOSAL_IN_TRAIN": os.environ.get("ADD_GTBOX_TO_PROPOSAL_IN_TRAIN", "1") != "0",
     }
 )
@@ -60,13 +69,18 @@ cfg["MODEL"]["SGDET_COMPAT"].update(
 # FILTER_METHOD is mandatory: the relation graph is never allowed to use all
 # detection pairs. PPG is the first sgdet baseline; RSGP can be selected after
 # this route is validated.
-_filter_method = os.environ.get("FILTER_METHOD", "PPG").upper()
+_filter_method = os.environ.get("FILTER_METHOD", "RSGP").upper()
 if _filter_method not in {"PPG", "PPN", "RSGP"}:
     raise ValueError("FILTER_METHOD must be PPG, PPN, or RSGP; unfiltered pair graphs are disabled.")
 cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_FILTER_METHOD"] = _filter_method
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_ENABLED"] = _filter_method == "PPG"
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PPN_ENABLED"] = _filter_method == "PPN"
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ENABLED"] = _filter_method == "RSGP"
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_MODE"] = os.environ.get("RSGP_MODE", "HYBRID").upper()
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_TOPK"] = int(os.environ.get("RSGP_TOPK", "10000"))
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_PPG_PROTECTED_TOPK"] = int(
+    os.environ.get("RSGP_PPG_PROTECTED_TOPK", "8000")
+)
 # PPG scores candidates before reducing to top-10000.  Bound the temporary
 # score/features chunk, not the original detector's post-NMS candidate set.
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_CHUNK_SIZE"] = int(
@@ -74,7 +88,7 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["PPG_CHUNK_SIZE"] = int(
 )
 
 # LOBB_RPCM_sgdet_train.sh: batch=2, max_iter=5000, milestones=(3000,4000).
-cfg["DATALOADER"]["TRAIN_BATCH_SIZE"] = int(os.environ.get("TRAIN_BATCH_SIZE", "2"))
+cfg["DATALOADER"]["TRAIN_BATCH_SIZE"] = int(os.environ.get("TRAIN_BATCH_SIZE", "4"))
 cfg["DATALOADER"]["VAL_BATCH_SIZE"] = int(os.environ.get("VAL_BATCH_SIZE", "1"))
 cfg["DATALOADER"]["TEST_BATCH_SIZE"] = int(os.environ.get("TEST_BATCH_SIZE", "1"))
 # Full STAR images ride in metadata until the detector crops a patch.  Avoid
@@ -83,11 +97,13 @@ cfg["DATALOADER"]["NUM_WORKERS"] = int(os.environ.get("NUM_WORKERS", "8"))
 cfg["SOLVER"]["IMS_PER_BATCH"] = cfg["DATALOADER"]["TRAIN_BATCH_SIZE"]
 cfg["TEST"]["IMS_PER_BATCH"] = cfg["DATALOADER"]["TEST_BATCH_SIZE"]
 cfg["SOLVER"]["BASE_LR"] = float(os.environ.get("BASE_LR", "1e-3"))
-cfg["SOLVER"]["MAX_ITER"] = int(os.environ.get("MAX_ITER", "5000"))
+cfg["SOLVER"]["LR_SCALE_BY_BATCH"] = os.environ.get("LR_SCALE_BY_BATCH", "1") != "0"
+cfg["SOLVER"]["MAX_ITER"] = int(os.environ.get("MAX_ITER", "20000"))
 cfg["SOLVER"]["MAX_EPOCHS"] = int(os.environ.get("MAX_EPOCHS", "100000"))
-cfg["SOLVER"]["STEPS"] = [3000, 4000]
+cfg["SOLVER"]["STEPS"] = [10000, 14000, 18000]
 cfg["SOLVER"]["ITERATION_COMPAT"] = True
 cfg["SOLVER"]["VAL_PERIOD"] = int(os.environ.get("VAL_PERIOD", "1000"))
-cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "1000"))
+cfg["SOLVER"]["VAL_START_PERIOD"] = int(os.environ.get("VAL_START_PERIOD", "10000"))
+cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "0"))
 cfg["SOLVER"]["VAL_SPLIT"] = os.environ.get("VAL_SPLIT", "test")
 cfg["SOLVER"]["OUTPUT_DIR"] = os.environ.get("OUTPUT_DIR", "outputs/star_sgdet_obb_train")

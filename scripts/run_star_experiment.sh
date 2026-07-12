@@ -12,6 +12,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_train}"
 INIT_RPCM="${INIT_RPCM:-}"
 START_EPOCH="${START_EPOCH:-}"
 RESUME="${RESUME:-}"
+RESET_SOLVER_ON_RESUME="${RESET_SOLVER_ON_RESUME:-}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/train.log}"
 
 cd "${ROOT_DIR}"
@@ -47,6 +48,9 @@ fi
 if [[ -n "${START_EPOCH}" ]]; then
   cmd+=(--start-epoch "${START_EPOCH}")
 fi
+if [[ -n "${RESET_SOLVER_ON_RESUME}" && "${RESET_SOLVER_ON_RESUME}" != "0" ]]; then
+  cmd+=(--reset-solver-on-resume)
+fi
 
 if [[ -n "${RESUME}" ]]; then
   nohup bash -lc '
@@ -72,6 +76,7 @@ echo "PID: ${pid}"
 echo "Config: ${CONFIG}"
 echo "Init RPCM: ${INIT_RPCM:-<none>}"
 echo "Resume: ${RESUME:-<none>}"
+echo "Reset solver on resume: ${RESET_SOLVER_ON_RESUME:-0}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Log: ${LOG_FILE}"
 echo "Status: ${STATUS_FILE}"

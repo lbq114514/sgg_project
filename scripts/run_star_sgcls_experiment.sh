@@ -7,6 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # inside the config; do not set INIT_RPCM unless explicitly studying transfer.
 CONFIG="${CONFIG:-configs/star_sgcls_obb_train.py}" \
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_sgcls_obb_train}" \
-FILTER_METHOD="${FILTER_METHOD:-PPG}" \
+FILTER_METHOD="${FILTER_METHOD:-RSGP}" \
+RSGP_MODE="${RSGP_MODE:-HYBRID}" \
+RSGP_TOPK="${RSGP_TOPK:-10000}" \
+RSGP_PPG_PROTECTED_TOPK="${RSGP_PPG_PROTECTED_TOPK:-8000}" \
 INIT_RPCM="${INIT_RPCM:-}" \
 bash "${SCRIPT_DIR}/run_star_experiment.sh"

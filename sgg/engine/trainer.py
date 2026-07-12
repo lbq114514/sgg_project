@@ -744,6 +744,28 @@ class Trainer:
             "HR": float("-inf"),
         }
 
+    def reset_solver_state(self, global_step: int = 0):
+        """Rebuild optimizer/scheduler from the current config after model load.
+
+        This is intentionally separate from normal checkpoint resume.  It is
+        useful when continuing from model weights while changing LR milestones:
+        loading the checkpoint scheduler would otherwise overwrite the new
+        config.
+        """
+        self.optimizer = self._build_optimizer(self.model)
+        self.scheduler = self._build_scheduler()
+        self.global_step = int(global_step)
+        if hasattr(self.scheduler, "last_epoch"):
+            self.scheduler.last_epoch = self.global_step
+        if hasattr(self.scheduler, "get_lr"):
+            for param_group, lr in zip(self.optimizer.param_groups, self.scheduler.get_lr()):
+                param_group["lr"] = lr
+        print(
+            "Reset optimizer/scheduler from current config:",
+            {"global_step": self.global_step, "lr": max(float(group["lr"]) for group in self.optimizer.param_groups)},
+            flush=True,
+        )
+
     def _apply_freeze_config(self):
         model_cfg = self.cfg.get("MODEL", {})
         sgdet_compat_freeze = (
@@ -968,9 +990,13 @@ class Trainer:
             "roi_heads.relation.ppg.",
             "roi_heads.relation.ppn.",
         )
+        model_init_missing_keys = {
+            "roi_heads.relation.predictor.out_obj.weight",
+            "roi_heads.relation.predictor.out_obj.bias",
+        }
         missing = [
             key for key in incompatible.missing_keys
-            if not key.startswith(filter_prefixes)
+            if not key.startswith(filter_prefixes) and key not in model_init_missing_keys
         ]
         unexpected = [
             key for key in incompatible.unexpected_keys
@@ -985,15 +1011,31 @@ class Trainer:
         ignored_unexpected = len(incompatible.unexpected_keys) - len(unexpected)
         if ignored_missing or ignored_unexpected:
             print(
-                "Checkpoint pair-filter state ignored:",
+                "Checkpoint optional state ignored:",
                 {"missing": ignored_missing, "unexpected": ignored_unexpected},
                 flush=True,
             )
+        resume_state_loaded = True
         if isinstance(ckpt, dict) and ckpt.get("optimizer") is not None:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-        if isinstance(ckpt, dict) and ckpt.get("scheduler") is not None and hasattr(self.scheduler, "load_state_dict"):
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            except (ValueError, RuntimeError) as exc:
+                resume_state_loaded = False
+                ckpt["_model_only_resume"] = True
+                ckpt["epoch"] = 0
+                print(
+                    "Checkpoint optimizer state is incompatible with the current model; "
+                    f"loaded model weights only and restarted optimizer/scheduler: {exc}",
+                    flush=True,
+                )
+        if (
+            resume_state_loaded
+            and isinstance(ckpt, dict)
+            and ckpt.get("scheduler") is not None
+            and hasattr(self.scheduler, "load_state_dict")
+        ):
             self.scheduler.load_state_dict(ckpt["scheduler"])
-        if isinstance(ckpt, dict) and "global_step" in ckpt:
+        if resume_state_loaded and isinstance(ckpt, dict) and "global_step" in ckpt:
             self.global_step = int(ckpt["global_step"])
         return ckpt
 

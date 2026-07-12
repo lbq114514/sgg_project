@@ -127,9 +127,22 @@ class SceneGraphDetector(nn.Module):
             raise ValueError(
                 "MODEL.SGDET_COMPAT.TRAIN_LABEL_SOURCE must be 'matched_gt' or 'pred'."
             )
+        self.sgdet_eval_label_source = str(sgdet_cfg.get("EVAL_LABEL_SOURCE", "matched_gt")).lower()
+        if self.sgdet_eval_label_source not in {"matched_gt", "pred"}:
+            raise ValueError(
+                "MODEL.SGDET_COMPAT.EVAL_LABEL_SOURCE must be 'matched_gt' or 'pred'."
+            )
         self.sgdet_add_gtbox_to_proposal_train = bool(
             sgdet_cfg.get("ADD_GTBOX_TO_PROPOSAL_IN_TRAIN", True)
         )
+        rel_head_cfg = model_cfg.get("ROI_RELATION_HEAD", {})
+        self.sgcls_filter_label_source = str(
+            rel_head_cfg.get("SGCLS_FILTER_LABEL_SOURCE", "pred")
+        ).lower()
+        if self.sgcls_filter_label_source not in {"gt", "pred"}:
+            raise ValueError(
+                "MODEL.ROI_RELATION_HEAD.SGCLS_FILTER_LABEL_SOURCE must be 'gt' or 'pred'."
+            )
         self.sgdet_rpn_anchor_generator = None
         self.sgdet_rpn_bbox_coder = None
 
@@ -240,7 +253,7 @@ class SceneGraphDetector(nn.Module):
                 detector_targets=detector_targets,
             )
         elif self.task == "sgdet" and self.patch_auto_enabled and self._should_use_patch_inference(images):
-            proposals = self._prepare_eval_proposals_with_patches(images)
+            proposals = self._prepare_eval_proposals_with_patches(images, targets)
         else:
             proposals = self._prepare_eval_proposals(features, images, targets)
         if self.roi_heads is None or "relation" not in self.roi_heads:
@@ -549,9 +562,19 @@ class SceneGraphDetector(nn.Module):
         )
         return result
 
-    def _assign_sgdet_training_labels(self, proposal: BoxList, target: BoxList) -> None:
-        """Attach detector-match labels used by original sgdet relation sampling."""
-        if self.sgdet_train_label_source == "pred" or len(proposal) == 0 or len(target) == 0:
+    def _assign_sgdet_labels(
+        self,
+        proposal: BoxList,
+        target: Optional[BoxList],
+        label_source: str,
+    ) -> None:
+        """Attach detector-match labels used by original sgdet relation sampling/filtering."""
+        if (
+            label_source == "pred"
+            or target is None
+            or len(proposal) == 0
+            or len(target) == 0
+        ):
             labels = proposal.get_field("pred_labels").long()
         else:
             ious = boxlist_iou(
@@ -564,6 +587,23 @@ class SceneGraphDetector(nn.Module):
             labels[max_iou < float(self.cfg["MODEL"]["ROI_HEADS"].get("FG_IOU_THRESHOLD", 0.5))] = 0
         proposal.add_field("labels", labels)
         proposal.add_field("gt_labels", labels)
+
+    def _assign_sgdet_training_labels(self, proposal: BoxList, target: BoxList) -> None:
+        self._assign_sgdet_labels(proposal, target, self.sgdet_train_label_source)
+
+    def _assign_sgdet_eval_labels(
+        self,
+        proposals: Sequence[BoxList],
+        targets: Optional[Sequence[BoxList]],
+    ) -> None:
+        if self.task != "sgdet":
+            return
+        if targets is None:
+            for proposal in proposals:
+                self._assign_sgdet_labels(proposal, None, "pred")
+            return
+        for proposal, target in zip(proposals, targets):
+            self._assign_sgdet_labels(proposal, target, self.sgdet_eval_label_source)
 
     def _prepare_eval_proposals(
         self,
@@ -607,22 +647,27 @@ class SceneGraphDetector(nn.Module):
                     pred_labels=pred_labels,
                     pred_scores=pred_scores,
                 )
-                proposal.add_field("labels", pred_labels)
+                if self.sgcls_filter_label_source == "pred":
+                    proposal.add_field("labels", pred_labels)
             return proposals
 
         if detector_images is not None:
-            return self._detect_sgdet_raw_to_relation_view(
+            proposals = self._detect_sgdet_raw_to_relation_view(
                 detector_images,
                 detector_targets,
                 targets,
             )
+            self._assign_sgdet_eval_labels(proposals, targets)
+            return proposals
 
-        return self._detect_sgdet_boxes(
+        proposals = self._detect_sgdet_boxes(
             features,
             images.shape[-2:],
             images.device,
             images=images,
         )
+        self._assign_sgdet_eval_labels(proposals, targets)
+        return proposals
 
     @torch.no_grad()
     def _detect_sgdet_raw_to_relation_view(
@@ -843,7 +888,8 @@ class SceneGraphDetector(nn.Module):
                         pred_labels=pred_labels,
                         pred_scores=pred_scores,
                     )
-                    proposal.add_field("labels", pred_labels)
+                    if self.sgcls_filter_label_source == "pred":
+                        proposal.add_field("labels", pred_labels)
                     node_feat = roi_feat + self.label_embed(pred_labels.clamp(min=0, max=self.num_classes - 1))
                 proposals.append(proposal)
                 node_feats.append(node_feat)
@@ -957,10 +1003,15 @@ class SceneGraphDetector(nn.Module):
         """Device holding the frozen d1 detector parameters."""
         return next(self.backbone.parameters()).device
 
-    def _prepare_eval_proposals_with_patches(self, images: torch.Tensor) -> List[BoxList]:
+    def _prepare_eval_proposals_with_patches(
+        self,
+        images: torch.Tensor,
+        targets: Optional[Sequence[BoxList]] = None,
+    ) -> List[BoxList]:
         proposals = []
         for image in images:
             proposals.append(self._detect_single_image_multiscale(image))
+        self._assign_sgdet_eval_labels(proposals, targets)
         return proposals
 
     def _detect_single_image_multiscale(self, image: torch.Tensor) -> BoxList:

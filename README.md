@@ -82,15 +82,15 @@ Evaluate a checkpoint:
 
 ```bash
 export STAR_SGG_ROOT=/path/to/STAR_SGG
-bash scripts/eval_once.sh
+bash scripts/eval_star_predcls.sh
 ```
 
 The active STAR experiment path is the aligned RPCM + PPG predcls setup. The scripts in `scripts/` are intentionally kept small:
 
 - `run_star_experiment.sh`: launch the main aligned RPCM training flow.
-- `eval_once.sh`: evaluate the aligned RPCM checkpoint.
+- `eval_once.sh`: strict low-level evaluation entry; requires explicit config, checkpoint, and output directory.
+- `eval_star_predcls.sh`, `eval_star_sgcls.sh`, `eval_star_sgdet.sh`: task-specific one-command evaluation wrappers.
 - `resume_star.sh`: resume the aligned RPCM training flow.
-- `dump_rpcm_current_probe.py`, `dump_rpcm_original_probe.py`, `compare_rpcm_probe_dumps.py`: one-image numeric alignment tools for checking the current implementation against the original RPCM repository.
 
 ## Reproducibility notes
 

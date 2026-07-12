@@ -1,9 +1,0 @@
-Running ppg_10000: filter=PPG, rsgp_mode=HYBRID, protected=7000
-Running ppn_10000: filter=PPN, rsgp_mode=HYBRID, protected=7000
-Running rsgp_rs_only: filter=RSGP, rsgp_mode=RS_ONLY, protected=0
-Running rsgp_ppn_graph: filter=RSGP, rsgp_mode=PPN_GRAPH, protected=0
-Running rsgp_hybrid_9000_1000: filter=RSGP, rsgp_mode=HYBRID, protected=9000
-Running rsgp_hybrid_8000_2000: filter=RSGP, rsgp_mode=HYBRID, protected=8000
-Running rsgp_hybrid_7000_3000: filter=RSGP, rsgp_mode=HYBRID, protected=7000
-Wrote outputs/rsgp_grid/comparison.json
-Done. Logs and JSON files are under outputs/rsgp_grid

@@ -48,6 +48,11 @@ def main():
     )
     parser.add_argument("--start-epoch", type=int, default=None, help="Epoch index to resume from, 0-based. Defaults to checkpoint epoch.")
     parser.add_argument("--resume-step", type=int, default=None, help="Override global training step after loading a checkpoint.")
+    parser.add_argument(
+        "--reset-solver-on-resume",
+        action="store_true",
+        help="Load model weights from --resume but rebuild optimizer/scheduler from the current config.",
+    )
     args = parser.parse_args()
 
     cfg = get_default_cfg()
@@ -87,6 +92,9 @@ def main():
         ckpt = trainer.load_checkpoint(args.resume)
         if isinstance(ckpt, dict) and "epoch" in ckpt:
             start_epoch = int(ckpt["epoch"])
+        if args.reset_solver_on_resume:
+            solver_step = int(args.resume_step if args.resume_step is not None else trainer.global_step)
+            trainer.reset_solver_state(global_step=solver_step)
     if args.start_epoch is not None:
         start_epoch = int(args.start_epoch)
     if args.resume_step is not None:

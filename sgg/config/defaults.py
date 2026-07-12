@@ -37,6 +37,7 @@ def get_default_cfg():
                 "RCNN_MAX_PER_IMG": 2000,
                 "PATCH_MERGE_NMS_THRESH": 0.4,
                 "TRAIN_LABEL_SOURCE": "matched_gt",  # matched_gt | pred
+                "EVAL_LABEL_SOURCE": "matched_gt",  # matched_gt | pred
                 "ADD_GTBOX_TO_PROPOSAL_IN_TRAIN": True,
             },
             # Object-class channel order of MODEL.PRETRAINED_DETECTOR.  The
