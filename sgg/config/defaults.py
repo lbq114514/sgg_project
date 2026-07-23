@@ -29,6 +29,10 @@ def get_default_cfg():
                 "D2_SCALE": 0.5,
                 "RPN_ANCHOR_SIZES": [32, 64, 128, 256, 512],
                 "RPN_ASPECT_RATIOS": [0.5, 1.0, 2.0],
+                # mmdet AnchorGenerator default used by the source STAR
+                # detector.  A 0.5 offset shifts every FPN anchor by half a
+                # stride and is incompatible with its pretrained RPN deltas.
+                "RPN_ANCHOR_OFFSET": 0.0,
                 "RPN_NMS_PRE": 2000,
                 "RPN_MAX_PER_IMG": 2000,
                 "RPN_NMS_THRESH": 0.8,
@@ -38,7 +42,22 @@ def get_default_cfg():
                 "PATCH_MERGE_NMS_THRESH": 0.4,
                 "TRAIN_LABEL_SOURCE": "matched_gt",  # matched_gt | pred
                 "EVAL_LABEL_SOURCE": "matched_gt",  # matched_gt | pred
-                "ADD_GTBOX_TO_PROPOSAL_IN_TRAIN": True,
+                "PATCH_DEBUG": False,
+                # The original STAR Sgdets branch calls the frozen detector's
+                # ``simple_test`` path in both train and test.  GT participates
+                # in proposal matching/relation supervision, but is not
+                # appended to the final detector proposal set.
+                "ADD_GTBOX_TO_PROPOSAL_IN_TRAIN": False,
+                # Frozen-detector acceleration for sgdet only.  The cache is
+                # generated offline and stores post-NMS proposals, not GT or
+                # relation targets. REQUIRE_HIT prevents accidental fallback
+                # to the multi-minute raw detector path.
+                "DETECTION_CACHE": {
+                    "ENABLED": False,
+                    "DIR": "outputs/star_sgdet_detection_cache_v5",
+                    "REQUIRE_HIT": True,
+                    "HASH": "",
+                },
             },
             # Object-class channel order of MODEL.PRETRAINED_DETECTOR.  The
             # project itself always stores background at channel zero; keep
@@ -116,6 +135,9 @@ def get_default_cfg():
                 "RPCM_PROTO_INIT": "semantic",
                 "RPCM_PROTO_EMBED_DIM": 0,
                 "RPCM_PROTO_GLOVE_PATH": "",
+                # ``rpcm`` reproduces the historical RPCM predicate polarity
+                # construction and raw-scale object GloVe embeddings.
+                "RPCM_GLOVE_INIT_MODE": "current",
                 "RPCM_OBJ_PROTO_INIT": "semantic",
                 "RPCM_PAIR_LABEL_PRIOR": True,
                 "RPCM_PAIR_PRIOR_DIM": 128,
@@ -192,35 +214,39 @@ def get_default_cfg():
                 "RSGP_W_TOPO": 0.20,
                 "RSGP_W_TAIL": 0.15,
                 "RSGP_W_DEGREE": 0.15,
+                # Component switches used for inference-only RSGP ablations.
+                # Defaults preserve the full RSGP behavior.
+                "RSGP_USE_PPN_COMPLETION": True,
+                "RSGP_USE_GEOMETRY": True,
+                "RSGP_USE_ANCHOR": True,
+                "RSGP_USE_TOPOLOGY": True,
+                "RSGP_USE_TAIL_PRIOR": True,
+                "RSGP_USE_DEGREE_SCORE": True,
+                "RSGP_ENFORCE_DEGREE_CAP": True,
+                "RSGP_ENFORCE_LABEL_QUOTA": True,
                 "RSGP_ANCHOR_CLASSES": "apron,truck_parking,car_parking,dock,runway,taxiway,breakwater,goods_yard",
                 "RSGP_VEHICLE_CLASSES": "airplane,aircraft,vehicle,car,truck,ship,boat,bus,van",
                 "RSGP_NETWORK_CLASSES": "tower,lattice_tower,substation,genset,transmission_line,power_line,line,pole",
                 "RSGP_TAIL_PREDICATES": [7, 14, 20, 24, 25, 28, 31, 33, 36, 38, 39, 41, 53, 56, 58],
                 "RPCM_LEGACY_FILTER_FLOW": False,
                 "RPCM_LEGACY_UNION_BOX": False,
-                "GRAPH_TOPK": 10000,
-                "GRAPH_PARTITION_SIZE": 2000,
-                "GRAPH_MAX_DEGREE": 48,
-                "GRAPH_RELAXED_MAX_DEGREE": 64,
-                "GRAPH_GT_INJECT_FULL_EPOCHS": 5,
-            "GRAPH_GT_INJECT_END_EPOCH": 10,
-            "GRAPH_CACHE_PATH": "",
-                "TYPED_GRAPH_HIDDEN_DIM": 512,
-                "TYPED_SPARSE_LAYERS": 2,
-                "TYPED_ANCHOR_TOPK": 4,
-                "TYPED_FAMILY_LOSS_WEIGHT": 0.5,
-                "TYPED_ANCHOR_LOSS_WEIGHT": 0.2,
-                "TYPED_LOGIC_LOSS_WEIGHT": 0.1,
-            "TYPED_HIERARCHY_LOGIT_WEIGHT": 1.0,
-                "TYPED_PROTO_LOGIT_WEIGHT": 0.0,
-                "TYPED_VEHICLE_AUX_ENABLED": False,
-                "TYPED_VEHICLE_AUX_LOSS_WEIGHT": 0.2,
-                "TYPED_VEHICLE_LOGIT_MAX_WEIGHT": 0.5,
-                "TYPED_VEHICLE_LOGIT_INIT": 0.0,
-                "TYPED_VEHICLE_PREDICATES": [6, 11, 31, 37, 38, 39, 41],
-                "TYPED_HYPERGRAPH_ENABLED": False,
-                "TYPED_HYPERGRAPH_LAYERS": 2,
-                "TYPED_HYPERGRAPH_HEADS": 4,
+                # Relation-to-relation topology used by RPCM_LEGACY and
+                # RPCM_ORIGINAL_LEGACY.  ``unified`` reproduces STAR's RCA
+                # convention: two relation nodes are adjacent whenever they
+                # share either endpoint (including subject/object cross-role
+                # matches).  ``dual_view`` keeps shared-subject and
+                # shared-object graphs separate.  Both modes reuse the same
+                # GCN parameters, so changing this flag does not change the
+                # checkpoint structure.
+                "RPCM_RELATION_GRAPH_MODE": "dual_view",  # sgg_toolkit | unified | dual_view
+                "RPCM_REL_SUBJ_VIEW_ENABLED": True,
+                "RPCM_REL_OBJ_VIEW_ENABLED": True,
+                # Exact training behavior of RPCM/weights/6850_4135.pth:
+                # K=1 prototypes, static initialization EMA, historic antonym
+                # loss, and layer-averaged dual-view object/relation states.
+                "RPCM_LEGACY_6850_EXACT": False,
+                "RPCM_LEGACY_ANT_LOSS_WEIGHT": 0.1,
+                "RPCM_LEGACY_ANT_MARGIN": -0.2,
                 "CAUSAL": {
                     "SPATIAL_FOR_VISION": True,
                 },
@@ -304,6 +330,8 @@ def get_default_cfg():
             "VAL_START_PERIOD": 0,
             "VAL_SPLIT": "val",
             "PRINT_GRAD_FREQ": 0,
+            "PRINT_TRAIN_STEP_FREQ": 0,
+            "PRINT_TRAIN_BATCH_FREQ": 0,
             "GRAD_NORM_CLIP": 5.0,
             "SCHEDULE": {
                 "TYPE": "WarmupMultiStepLR",
@@ -327,10 +355,17 @@ def get_default_cfg():
         "TEST": {
             "RECALL_AT": [20, 50, 100],
             "IOU_THRESHOLD": 0.5,
+            "RELATION": {
+                "LATER_NMS_PREDICTION_THRES": 0.3,
+            },
             "EVAL_DEBUG": {
                 "ENABLED": False,
                 "TOP_PREDICATES": 10,
                 "TOP_IMAGES": 10,
+                "PRINT_HARDEST_IMAGES": False,
+                "PRINT_CANDIDATE_COVERAGE": False,
+                "PRINT_PAIR_CONFUSION": False,
+                "PRINT_VEHICLE_AUX": False,
             },
             "GRAPH_DEBUG": {
                 "ENABLED": False,

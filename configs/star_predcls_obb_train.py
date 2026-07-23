@@ -1,3 +1,20 @@
+"""Main configuration for STAR OBB Predicate Classification (PredCls).
+
+Task protocol: GT OBBs and GT object labels are provided; the model predicts
+only predicates between entity pairs. The complete detector/backbone remains
+part of the checkpoint but is frozen in PredCls. It supplies RoI/union visual
+features rather than generating boxes or object labels.
+
+Common runtime overrides:
+    FILTER_METHOD=PPG|PPN|RSGP
+    OUTPUT_DIR=outputs/...
+    BASE_LR=... MAX_EPOCHS=...
+    VAL_START_PERIOD=... VAL_PERIOD=...
+
+Important: STAR images may contain many entities. FILTER_METHOD must not be
+empty because an all-pairs graph can cause OOM.
+"""
+
 import os
 
 from sgg.config.defaults import get_default_cfg
@@ -17,6 +34,13 @@ def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def _env_list_int(name: str, default):
     value = os.environ.get(name)
     if value is None or not value.strip():
@@ -24,6 +48,9 @@ def _env_list_int(name: str, default):
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+# ---------------------------------------------------------------------------
+# 1. Task protocol and detector freezing policy
+# ---------------------------------------------------------------------------
 cfg = get_default_cfg()
 cfg["MODEL"]["TASK"] = "predcls"
 cfg["MODEL"]["BOX_MODE"] = "obb"
@@ -35,6 +62,11 @@ cfg["MODEL"]["FREEZE_RPN_HEAD"] = True
 cfg["MODEL"]["FREEZE_ROI_HEAD"] = True
 cfg["MODEL"]["STORE_DETECTOR_D2"] = True
 
+# ---------------------------------------------------------------------------
+# 2. Relation predictor and prototype settings
+# RPCM_ORIGINAL_LEGACY is the main route and preserves the original RPCM
+# feature, GCN, and prototype logic.
+# ---------------------------------------------------------------------------
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PREDICTOR"] = "RPCM_ORIGINAL_LEGACY"
 cfg["MODEL"]["ROI_RELATION_HEAD"]["USE_GT_BOX"] = True
 cfg["MODEL"]["ROI_RELATION_HEAD"]["USE_GT_OBJECT_LABEL"] = True
@@ -64,6 +96,12 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["BATCH_SIZE_PER_IMAGE"] = 512
 cfg["MODEL"]["ROI_RELATION_HEAD"]["POSITIVE_FRACTION"] = 0.25
 cfg["MODEL"]["ROI_RELATION_HEAD"]["MAX_TEST_PAIRS_PER_IMAGE"] = 0
 cfg["MODEL"]["ROI_RELATION_HEAD"]["TEST_PAIR_SAMPLER"] = "ALL"
+# ---------------------------------------------------------------------------
+# 3. Pair filter
+# PPG: original paper baseline; PPN: independent label+OBB network;
+# RSGP: hybrid graph using PPG, PPN, and remote-sensing priors.
+# This stage selects candidate pairs only. RPCM still predicts predicates.
+# ---------------------------------------------------------------------------
 _filter_method = os.environ.get(
     "FILTER_METHOD",
     os.environ.get("TEST_FILTER_METHOD", "PPG"),
@@ -139,6 +177,30 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_ANCHOR"] = _env_float("RSGP_W_ANCHOR",
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_TOPO"] = _env_float("RSGP_W_TOPO", 0.20)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_TAIL"] = _env_float("RSGP_W_TAIL", 0.15)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_W_DEGREE"] = _env_float("RSGP_W_DEGREE", 0.15)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_PPN_COMPLETION"] = _env_bool(
+    "RSGP_USE_PPN_COMPLETION", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_GEOMETRY"] = _env_bool(
+    "RSGP_USE_GEOMETRY", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_ANCHOR"] = _env_bool(
+    "RSGP_USE_ANCHOR", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_TOPOLOGY"] = _env_bool(
+    "RSGP_USE_TOPOLOGY", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_TAIL_PRIOR"] = _env_bool(
+    "RSGP_USE_TAIL_PRIOR", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_USE_DEGREE_SCORE"] = _env_bool(
+    "RSGP_USE_DEGREE_SCORE", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ENFORCE_DEGREE_CAP"] = _env_bool(
+    "RSGP_ENFORCE_DEGREE_CAP", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ENFORCE_LABEL_QUOTA"] = _env_bool(
+    "RSGP_ENFORCE_LABEL_QUOTA", True
+)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RSGP_ANCHOR_CLASSES"] = os.environ.get(
     "RSGP_ANCHOR_CLASSES",
     "apron,truck_parking,car_parking,dock,runway,taxiway,breakwater,goods_yard",
@@ -164,8 +226,25 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_PAIR_LABEL_PRIOR"] = False
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PAIRWISE_EMBED_EXTRA_BACKGROUND"] = False
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_PROTO_EMBED_DIM"] = 300
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_PROTO_GLOVE_PATH"] = "glove/glove.6B.300d.txt"
+# Reproduce the GloVe construction used to train RPCM 6850_4135: raw 200-D
+# object embeddings in PairwiseFeatureExtractor and polarity-aware normalized
+# 300-D predicate prototypes. This affects scratch initialization only;
+# checkpoint-loaded embeddings are still restored from the checkpoint.
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_GLOVE_INIT_MODE"] = "rpcm"
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_FILTER_FLOW"] = True
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_UNION_BOX"] = True
+# ``unified`` is the STAR/SGG-ToolKit relation adjacency. ``dual_view`` is the
+# role-aware variant that propagates shared-subject and shared-object messages
+# separately. The switch changes no parameter names or tensor shapes.
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_RELATION_GRAPH_MODE"] = os.environ.get(
+    "RPCM_RELATION_GRAPH_MODE", "dual_view"
+).lower()
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_REL_SUBJ_VIEW_ENABLED"] = _env_bool(
+    "RPCM_REL_SUBJ_VIEW_ENABLED", True
+)
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_REL_OBJ_VIEW_ENABLED"] = _env_bool(
+    "RPCM_REL_OBJ_VIEW_ENABLED", True
+)
 cfg["MODEL"]["ROI_RELATION_HEAD"]["PREDICT_USE_BIAS"] = False
 cfg["MODEL"]["ROI_RELATION_HEAD"]["BIAS_LAMBDA"] = 0.2
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_BIAS_LAMBDA_TRAIN"] = 0.4
@@ -174,7 +253,21 @@ cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_NUM_PROTO"] = 1
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_USE_VIS_PROTO"] = False
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_PROTO_2D_COMPAT"] = True
 cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_REGISTER_BIAS_MODULE"] = False
+# Reproduce the exact relation-head version that generated 6850_4135.pth.
+# This keeps its single prototype, static proto_ema anchor, historic antonym
+# objective, and dual-view layer averaging.  It adds no checkpoint tensors, so
+# existing 6850/tail-aux/SGCls/SGDet checkpoints remain structurally loadable.
+# PredCls inference is unchanged; SGCls/SGDet must still be one-shot evaluated
+# because their object-refinement path consumes the restored entity average.
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_6850_EXACT"] = True
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_ANT_LOSS_WEIGHT"] = 0.1
+cfg["MODEL"]["ROI_RELATION_HEAD"]["RPCM_LEGACY_ANT_MARGIN"] = -0.2
 
+# ---------------------------------------------------------------------------
+# 4. Frozen OBB detector and RoI feature-extractor architecture
+# These dimensions must match pretrained/OBB_swin_L_OBD.pth and the RPCM
+# input dimensions.
+# ---------------------------------------------------------------------------
 cfg["MODEL"]["BACKBONE"] = {
     "NAME": "swin",
     "EMBED_DIMS": 192,
@@ -231,6 +324,11 @@ cfg["MODEL"]["ROI_HEADS"]["POSITIVE_FRACTION"] = 0.5
 cfg["MODEL"]["ROI_HEADS"]["DETECTIONS_PER_IMG"] = 80
 cfg["MODEL"]["ROI_BOX_HEAD"]["MLP_HEAD_DIM"] = 4096
 
+# ---------------------------------------------------------------------------
+# 5. Data loading and optimizer
+# LR_SCALE_BY_BATCH=False means BASE_LR is the actual target learning rate;
+# it is not automatically scaled with batch size.
+# ---------------------------------------------------------------------------
 cfg["DATALOADER"]["BATCH_SIZE"] = 8
 cfg["DATALOADER"]["TRAIN_BATCH_SIZE"] = 16
 cfg["DATALOADER"]["VAL_BATCH_SIZE"] = int(os.environ.get("VAL_BATCH_SIZE", "2"))
@@ -249,6 +347,9 @@ cfg["SOLVER"]["WARMUP_ITERS"] = 500
 cfg["SOLVER"]["WARMUP_EPOCHS"] = 0
 cfg["SOLVER"]["WARMUP_FACTOR"] = 0.1
 cfg["SOLVER"]["WARMUP_METHOD"] = "linear"
+# PredCls is trained by epoch. MultiStep uses UNIT="iter", so STEPS contains
+# optimizer-step indices, while VAL_START_PERIOD/VAL_PERIOD are epoch counts.
+# Do not mix these two counters.
 cfg["SOLVER"]["MAX_EPOCHS"] = int(os.environ.get("MAX_EPOCHS", "300"))
 cfg["SOLVER"]["OUTPUT_DIR"] = os.environ.get("OUTPUT_DIR", "outputs/star_predcls_obb_train")
 cfg["SOLVER"]["CHECKPOINT_PERIOD"] = int(os.environ.get("CHECKPOINT_PERIOD", "4"))
@@ -259,12 +360,12 @@ cfg["SOLVER"]["PRINT_GRAD_FREQ"] = 0
 cfg["SOLVER"]["GRAD_NORM_CLIP"] = 5.0
 cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupMultiStepLR"
 cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "iter"
-cfg["SOLVER"]["STEPS"] = [6000, 8500, 10000]
+cfg["SOLVER"]["STEPS"] = [12000, 16000, 18500]
 cfg["SOLVER"]["GAMMA"] = 0.1
 cfg["SOLVER"]["SCHEDULE"]["MIN_LR_RATIO"] = 0.0
 cfg["SOLVER"]["SCHEDULE"]["EXP_GAMMA"] = 0.9999
 
-# 可选学习率计划:
+# Optional learning-rate schedules:
 # 1) MultiStep:
 # cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "WarmupMultiStepLR"
 # cfg["SOLVER"]["SCHEDULE"]["UNIT"] = "epoch"
@@ -296,11 +397,19 @@ cfg["SOLVER"]["SCHEDULE"]["EXP_GAMMA"] = 0.9999
 # 6) Constant:
 # cfg["SOLVER"]["SCHEDULE"]["TYPE"] = "none"
 
-cfg["TEST"]["RECALL_AT"] = [1500, 2000]
+# ---------------------------------------------------------------------------
+# 6. Evaluation and large-image patch settings
+# The STAR paper protocol reports R/mR/HMR@1000/1500/2000.
+# ---------------------------------------------------------------------------
+cfg["TEST"]["RECALL_AT"] = [1000, 1500, 2000]
 cfg["TEST"]["EVAL_DEBUG"] = {
     "ENABLED": True,
     "TOP_PREDICATES": 10,
     "TOP_IMAGES": 10,
+    "PRINT_HARDEST_IMAGES": _env_bool("EVAL_DEBUG_PRINT_HARDEST_IMAGES", False),
+    "PRINT_CANDIDATE_COVERAGE": _env_bool("EVAL_DEBUG_PRINT_CANDIDATE_COVERAGE", False),
+    "PRINT_PAIR_CONFUSION": _env_bool("EVAL_DEBUG_PRINT_PAIR_CONFUSION", False),
+    "PRINT_VEHICLE_AUX": _env_bool("EVAL_DEBUG_PRINT_VEHICLE_AUX", False),
 }
 cfg["TEST"]["PATCH_AUTO_ENABLED"] = True
 cfg["TEST"]["PATCH_AUTO_MIN_SIZE"] = 1024
@@ -313,6 +422,12 @@ cfg["TEST"]["PATCH_SCORE_THRESHOLDS"] = [0.3, 0.2, 0.1, 0.001, 0.00001]
 cfg["mbs"] = 512
 cfg["feat_update_step"] = 4
 
+# ---------------------------------------------------------------------------
+# 7. STAR dataset
+# The fixed split matches the source project. Relation deduplication keeps the
+# single-predicate-per-pair GC Recall protocol. BOX_COORD_SCALE is the scene
+# scale used for STAR OBB coordinate normalization.
+# ---------------------------------------------------------------------------
 for split in ("TRAIN", "VAL", "TEST"):
     cfg["DATASETS"][split]["NAME"] = "star"
     cfg["DATASETS"][split]["IMAGE_ROOT"] = f"{DATA_ROOT}/STAR_img"

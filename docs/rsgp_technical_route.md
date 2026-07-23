@@ -45,7 +45,7 @@ Remote-sensing Graph-aware Pair Proposal (RSGP)
 
 ```text
 CONFIG=configs/star_predcls_obb_tail_aux_train.py
-CHECKPOINT=outputs/star_predcls_obb_tail_aux/best.pth
+CHECKPOINT=outputs/star_predcls_obb_tail_aux/best_bgfirst.pth
 ```
 
 ## 3. RSGP 默认流程
@@ -200,7 +200,11 @@ not working on
 
 ## 5. RPCM 适配原则
 
-当前 RPCM legacy 使用 dense relation-to-relation GCN。
+当前 relation base 忠实采用 `6850_4135.pth` 对应的 RPCM 版本：每个
+predicate 使用一个 GloVe prototype，`proto_ema` 是静态初始化锚点；GNN
+分别在 shared-subject 和 shared-object 两个 dense relation view 上传递
+信息，迭代 4 次并对输入层及全部更新层取均值。RSGP 不修改这些 relation
+head 规则，只改变送入 RPCM 的候选边集合。
 
 候选 pair 数和图拓扑会直接影响：
 
@@ -241,7 +245,7 @@ label-pair quota: 800 -> 1200
 
 ```text
 CONFIG=configs/star_predcls_obb_tail_aux_train.py
-CHECKPOINT=outputs/star_predcls_obb_tail_aux/best.pth
+CHECKPOINT=outputs/star_predcls_obb_tail_aux/best_bgfirst.pth
 TEST_BATCH_SIZE=1
 VAL_BATCH_SIZE=1
 ```
@@ -299,7 +303,6 @@ PPG HMR@2000 = 0.5392
 R@2000 >= 0.690
 mR@2000 > 0.4417
 HMR@2000 > 0.5392
-不增加 OOM 风险
 ```
 
 必须同时报告：
@@ -312,7 +315,6 @@ HMR@2000 > 0.5392
 - 平均/最大 out-degree
 - PPG/PPN/RSGP edge overlap
 - hardest images
-- 推理时间和峰值显存
 
 ## 8. 后续方向
 

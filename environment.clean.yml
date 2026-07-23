@@ -1,0 +1,11 @@
+name: sgg
+channels:
+  - defaults
+dependencies:
+  # Keep Python aligned with torch 2.2.2 and the legacy mmcv-full 1.7.2 CUDA
+  # extension. Upgrading Python alone can leave no compatible binary/build.
+  - python=3.11
+  - pip
+  # Ninja is only a build accelerator, so its exact patch version is not part
+  # of the model runtime contract.
+  - ninja

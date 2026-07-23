@@ -12,7 +12,9 @@ class SemanticPairFilter(nn.Module):
         super().__init__()
         rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
         self.enabled = bool(rel_cfg.get("SEMA_F_ENABLED", False))
-        self.path = Path(str(rel_cfg.get("SEMA_F_PATH", "pretrained/SF_list.json")))
+        self.path = Path(
+            str(rel_cfg.get("SEMA_F_PATH", "pretrained/SF_list_support.json"))
+        )
         self.register_buffer("pair_prior", torch.zeros((0, 0, 0), dtype=torch.float32), persistent=False)
         self.loaded = False
         self._load_prior()

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-pyg}"
+CONDA_ENV="${CONDA_ENV:-sgg}"
 CONFIG="${CONFIG:-configs/star_predcls_obb_tail_aux_train.py}"
 CHECKPOINT="${CHECKPOINT:-outputs/star_predcls_obb_tail_aux/best.pth}"
 CHECKPOINT_LOAD_MODE="${CHECKPOINT_LOAD_MODE:-full}"

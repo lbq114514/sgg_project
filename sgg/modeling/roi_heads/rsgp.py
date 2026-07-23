@@ -36,6 +36,13 @@ def _as_int(rel_cfg: dict, key: str, default: int) -> int:
     return int(rel_cfg.get(key, default))
 
 
+def _as_bool(rel_cfg: dict, key: str, default: bool) -> bool:
+    value = rel_cfg.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
 def _zscore(values: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
     if values.numel() == 0:
         return values
@@ -91,6 +98,14 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         self.w_topo = _as_float(rel_cfg, "RSGP_W_TOPO", 0.20)
         self.w_tail = _as_float(rel_cfg, "RSGP_W_TAIL", 0.15)
         self.w_degree = _as_float(rel_cfg, "RSGP_W_DEGREE", 0.15)
+        self.use_ppn_completion = _as_bool(rel_cfg, "RSGP_USE_PPN_COMPLETION", True)
+        self.use_geometry = _as_bool(rel_cfg, "RSGP_USE_GEOMETRY", True)
+        self.use_anchor = _as_bool(rel_cfg, "RSGP_USE_ANCHOR", True)
+        self.use_topology = _as_bool(rel_cfg, "RSGP_USE_TOPOLOGY", True)
+        self.use_tail_prior = _as_bool(rel_cfg, "RSGP_USE_TAIL_PRIOR", True)
+        self.use_degree_score = _as_bool(rel_cfg, "RSGP_USE_DEGREE_SCORE", True)
+        self.enforce_degree_cap = _as_bool(rel_cfg, "RSGP_ENFORCE_DEGREE_CAP", True)
+        self.enforce_label_quota = _as_bool(rel_cfg, "RSGP_ENFORCE_LABEL_QUOTA", True)
 
         self.class_names = list(_cfg_get(cfg, "MODEL", "ROI_BOX_HEAD", "CLASS_NAMES", default=[]))
         self.anchor_class_ids = self._find_class_ids(
@@ -121,12 +136,19 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         self._load_tail_support(rel_cfg)
 
         self.ppg = self._make_ppg(cfg) if self.mode in {"HYBRID"} else None
-        self.ppn = self._make_ppn(cfg) if self.mode in {"HYBRID", "PPN_GRAPH"} else None
+        self.ppn = (
+            self._make_ppn(cfg)
+            if self.use_ppn_completion and self.mode in {"HYBRID", "PPN_GRAPH"}
+            else None
+        )
         print(
             "[RSGP] "
             f"mode={self.mode}, topk={self.topk}, ppg_protected={self.ppg_protected_topk}, "
             f"ppn_pool={self.ppn_pool_topk}, rs_pool={self.rs_pool_topk}, "
             f"degree={self.max_out_degree}/{self.max_in_degree}, "
+            f"components=ppn:{self.use_ppn_completion},geom:{self.use_geometry},"
+            f"anchor:{self.use_anchor},topo:{self.use_topology},tail:{self.use_tail_prior},"
+            f"degree_cap:{self.enforce_degree_cap},quota:{self.enforce_label_quota}, "
             f"anchors={len(self.anchor_class_ids)}, vehicles={len(self.vehicle_class_ids)}, "
             f"networks={len(self.network_class_ids)}",
             flush=True,
@@ -305,7 +327,11 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         anchor = _zscore(parts["anchor"], parts["anchor"].ne(0))
         topo = _zscore(parts["topo"], parts["topo"].ne(0))
         tail = parts["tail"]
-        degree = _zscore(self._degree_balance_scores(proposal, candidate_pairs))
+        degree = (
+            _zscore(self._degree_balance_scores(proposal, candidate_pairs))
+            if self.use_degree_score
+            else candidate_pairs.new_zeros((candidate_pairs.size(0),), dtype=torch.float32)
+        )
         ppg = self._rank_score(candidate_pairs, ppg_pairs, high_is_good=True)
         ppn = self._source_score(candidate_pairs, ppn_pairs, ppn_pair_scores)
         ppg = _zscore(ppg, ppg.ne(0))
@@ -363,10 +389,24 @@ class RemoteSensingGraphProposalFilter(nn.Module):
         parallel = torch.cos(angle_diff).abs()
         close = torch.exp(-dist_norm.clamp(min=0, max=20))
         geom = 0.35 * iou + 0.30 * close + 0.20 * compact + 0.15 * parallel
+        if not self.use_geometry:
+            geom = geom.zero_()
 
-        anchor = self._anchor_scores(labels, centers, sizes, pairs)
-        topo = self._topology_scores(labels, centers, sizes, angles, pairs, dist_norm, delta)
-        tail = self._tail_scores(labels, pairs)
+        anchor = (
+            self._anchor_scores(labels, centers, sizes, pairs)
+            if self.use_anchor
+            else geom.new_zeros(geom.shape)
+        )
+        topo = (
+            self._topology_scores(labels, centers, sizes, angles, pairs, dist_norm, delta)
+            if self.use_topology
+            else geom.new_zeros(geom.shape)
+        )
+        tail = (
+            self._tail_scores(labels, pairs)
+            if self.use_tail_prior
+            else geom.new_zeros(geom.shape)
+        )
         rs_total = geom + 0.7 * anchor + 0.6 * topo + 0.35 * tail
         return {"geom": geom, "anchor": anchor, "topo": topo, "tail": tail, "rs_total": rs_total}
 
@@ -525,10 +565,12 @@ class RemoteSensingGraphProposalFilter(nn.Module):
             if len(selected) >= self.topk or pair in selected_set or pair[0] == pair[1]:
                 return False
             if enforce:
-                if out_degree[pair[0]] >= max_out_degree or in_degree[pair[1]] >= max_in_degree:
+                if self.enforce_degree_cap and (
+                    out_degree[pair[0]] >= max_out_degree or in_degree[pair[1]] >= max_in_degree
+                ):
                     return False
                 label_pair = (int(labels[pair[0]]), int(labels[pair[1]]))
-                if label_counts.get(label_pair, 0) >= label_quota:
+                if self.enforce_label_quota and label_counts.get(label_pair, 0) >= label_quota:
                     return False
             selected.append(pair)
             selected_set.add(pair)

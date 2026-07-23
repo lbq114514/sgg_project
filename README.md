@@ -1,45 +1,87 @@
-# STAR Scene Graph Generation
+# STAR OBB Scene Graph Generation
 
-PyTorch research code for scene graph generation (SGG) with horizontal bounding boxes (HBB) and oriented bounding boxes (OBB). The repository contains a modular detector, ROI and relation heads, STAR dataset loading, training/evaluation entry points, and ablation configurations.
+PyTorch implementation of oriented-bounding-box (OBB) scene graph generation
+on STAR. The current project covers Predicate Classification (PredCls), Scene
+Graph Classification (SGCls), and Scene Graph Detection (SGDet).
 
-## Features
+The main method contains three parts:
 
-- HBB and OBB support through a shared `BoxList` abstraction
-- Swin Transformer backbone and feature pyramid network
-- Oriented RPN, ROI extraction, and box heads
-- Predicate classification with RPCM, prototype learning, PPG, and semantic filtering
-- STAR-SGG training, evaluation, analysis, and ablation scripts
+- **Role-aware Relation Context Aggregation (RCA)** separates
+  shared-subject and shared-object edge propagation.
+- **Hard-Predicate Residual Calibration (HPRC)** combines weak logit
+  adjustment with a zero-initialized residual calibration head. Historical
+  code/configuration keys retain the `tail_aux` name for checkpoint
+  compatibility.
+- **Remote-sensing Graph-aware Pair Proposal (RSGP)** combines PPG, PPN, OBB
+  geometry, remote-sensing topology, degree control, and label-pair quotas to
+  construct the inference candidate graph.
+
+SGDet uses a read-only detection cache so the frozen full-resolution
+multi-scale detector is not rerun during every relation-head update.
+
+## Task protocols
+
+| Task | Boxes | Object labels | Predicates |
+|---|---|---|---|
+| PredCls | ground truth | ground truth | predicted |
+| SGCls | ground truth | predicted | predicted |
+| SGDet | predicted | predicted | predicted |
+
+The default SGCls/SGDet pair-filter label sources reproduce the STAR
+SGG-ToolKit comparison protocol:
+
+```text
+SGCLS_FILTER_LABEL_SOURCE=gt
+SGDET_FILTER_LABEL_SOURCE=matched_gt
+```
+
+These labels are used for relation candidate filtering only. Final object and
+triplet predictions still come from the model. Use `pred` for stricter
+fully-predicted-label ablations.
 
 ## Repository layout
 
 ```text
-configs/       STAR training and ablation configurations
-scripts/       experiment launchers and analysis scripts
-sgg/           datasets, models, structures, evaluation, and training engine
-tools/         dataset and experiment utilities
-toy_data/      small tracked sample dataset
-train.py       training entry point
-eval.py        evaluation entry point
-train_demo.py  synthetic-data smoke test
+configs/   OBB task and paper-ablation configurations
+scripts/   one-command training, evaluation, cache, and experiment launchers
+sgg/       datasets, detector, relation models, structures, and evaluation
+tools/     focused diagnostics, cache builders, migrations, and PPN utilities
+tests/     numerical, checkpoint-compatibility, and integration tests
+train.py   common training entry point
 ```
 
-Generated outputs, logs, datasets, and model checkpoints are intentionally excluded from Git. In particular, the multi-GB files under `outputs/` and `pretrained/` must be distributed separately (for example through a release, object storage, or Git LFS).
+Generated datasets, embeddings, detection caches, logs, and checkpoints are
+excluded from Git.
 
 ## Installation
 
-Python 3.10+ is recommended. Install PyTorch for the CUDA version on your machine first, then install the remaining dependencies:
+The tested environment uses Python 3.11, PyTorch 2.2.2 with CUDA 12.1,
+torchvision 0.17.2, and `mmcv-full==1.7.2`.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+ENV_NAME=sgg \
+CUDA_HOME=/usr/local/cuda-12.1 \
+MAX_JOBS=8 \
+  bash scripts/create_clean_env.sh
+
+conda activate sgg
+python tools/check_environment.py --strict --require-cuda
 ```
 
-`mmcv` may require a wheel matching the installed PyTorch/CUDA combination. Follow its platform-specific installation instructions if a regular `pip` install cannot build it.
+The installer creates a new environment from scratch and does not import the
+original RPCM or SGG-ToolKit checkout. See [INSTALL.md](INSTALL.md) for the
+complete procedure and [docs/environment_setup.md](docs/environment_setup.md)
+for the dependency boundary.
 
-## Data and pretrained files
+## Data and pretrained artifacts
 
-Set `STAR_SGG_ROOT` to a STAR-SGG directory with this structure:
+Set the dataset root:
+
+```bash
+export STAR_SGG_ROOT=/path/to/STAR_SGG
+```
+
+Expected STAR files:
 
 ```text
 $STAR_SGG_ROOT/
@@ -49,55 +91,189 @@ $STAR_SGG_ROOT/
 └── STAR_image_data_v1.json
 ```
 
-The main configuration also expects these files locally:
+Expected local artifacts:
 
 ```text
 pretrained/
-├── OBB_swin_L_OBD.pth
-├── STAR_HBB.pth
-├── STAR_OBB.pth
-└── SF_list_support.json
+├── OBB_swin_L_OBD.pth       # frozen OBB detector
+├── STAR_OBB.pth             # original PPG
+├── PPN_OBB.pth              # independent PPN
+└── SF_list_support.json     # semantic label-pair support
+
+glove/
+├── glove.6B.200d.txt
+└── glove.6B.300d.txt
 ```
 
-The JSON semantic-filter files are small enough to commit; checkpoint files are ignored by default.
+Binary weights and GloVe files are intentionally ignored by Git. The semantic
+support JSON remains trackable.
 
-GloVe text embeddings are loaded from `glove/glove.6B.200d.txt`. Pair proposal training uses the converted tensor file `glove/glove.6B.200d.pt`. The local `glove/` directory is excluded from Git because these files are large.
+## Training
 
-## Usage
+All commands run in the background and write `train.log`, `train.pid`, and
+`exit_code.txt` below their output directory.
 
-Run the synthetic smoke test without STAR data:
-
-```bash
-python train_demo.py
-```
-
-Train on STAR-SGG:
+### PredCls RPCM/RCA base
 
 ```bash
-export STAR_SGG_ROOT=/path/to/STAR_SGG
 bash scripts/run_star_experiment.sh
 ```
 
-Evaluate a checkpoint:
+The default fresh run loads only `pretrained/OBB_swin_L_OBD.pth`; the relation
+stack is initialized from its configured RPCM/GloVe initializers.
+
+### PredCls HPRC
 
 ```bash
-export STAR_SGG_ROOT=/path/to/STAR_SGG
-bash scripts/eval_star_predcls.sh
+bash scripts/run_star_tail_aux.sh
 ```
 
-The active STAR experiment path is the aligned RPCM + PPG predcls setup. The scripts in `scripts/` are intentionally kept small:
+Despite its historical filename, this is the clean HPRC scratch launcher. It
+forces `INIT_RPCM=''`, uses the corrected exact-6850 dual-view/GloVe
+initialization, and writes to:
 
-- `run_star_experiment.sh`: launch the main aligned RPCM training flow.
-- `eval_once.sh`: strict low-level evaluation entry; requires explicit config, checkpoint, and output directory.
-- `eval_star_predcls.sh`, `eval_star_sgcls.sh`, `eval_star_sgdet.sh`: task-specific one-command evaluation wrappers.
-- `resume_star.sh`: resume the aligned RPCM training flow.
+```text
+outputs/star_predcls_obb_hprc_scratch/
+```
+
+The launcher isolates its schedule from generic variables exported by other
+experiments. Use HPRC-specific overrides when needed:
+
+```bash
+HPRC_MAX_EPOCHS=300 \
+HPRC_STEPS=10000,14000,16000 \
+HPRC_VAL_START_PERIOD=120 \
+bash scripts/run_star_tail_aux.sh
+```
+
+### SGCls
+
+```bash
+bash scripts/run_star_sgcls_experiment.sh
+```
+
+### SGDet
+
+Build the frozen-detector cache once:
+
+```bash
+SPLITS=train,test bash scripts/build_sgdet_detection_cache.sh
+```
+
+Then train the relation stack from the cache:
+
+```bash
+bash scripts/run_star_sgdet_experiment.sh
+```
+
+The launcher requires cache hits by default. Changing detector/RPN/RCNN/NMS
+settings changes the cache hash and requires rebuilding the cache.
+
+### Resume
+
+Use the same task launcher with a full checkpoint:
+
+```bash
+RESUME=outputs/star_predcls_obb_hprc_scratch/model_last.pth \
+  bash scripts/run_star_tail_aux.sh
+
+RESUME=outputs/star_sgcls_obb_train/model_last.pth \
+  bash scripts/run_star_sgcls_experiment.sh
+
+RESUME=outputs/star_sgdet_obb_train/model_last.pth \
+  bash scripts/run_star_sgdet_experiment.sh
+```
+
+## Evaluation
+
+Task-specific wrappers automatically choose the corresponding best/last
+checkpoint when possible:
+
+```bash
+bash scripts/eval_star_predcls.sh
+bash scripts/eval_star_sgcls.sh
+bash scripts/eval_star_sgdet.sh
+```
+
+Choose the pair filter explicitly when comparing methods:
+
+```bash
+FILTER_METHOD=PPG bash scripts/eval_star_predcls.sh
+FILTER_METHOD=PPN bash scripts/eval_star_predcls.sh
+FILTER_METHOD=RSGP bash scripts/eval_star_predcls.sh
+```
+
+Use `CHECKPOINT`, `CONFIG`, `OUTPUT_DIR`, and `SPLIT` to override wrapper
+defaults. `scripts/eval_once.sh` is the low-level strict entry point used by
+all three wrappers.
+
+## Paper experiments
+
+The compact reproducibility entry points are:
+
+```bash
+# Existing/scratch PredCls relation-head rows
+bash scripts/eval_predcls_minimal_ablation.sh 6850
+bash scripts/run_predcls_minimal_ablation.sh A
+bash scripts/run_predcls_minimal_ablation.sh B
+bash scripts/run_predcls_minimal_ablation.sh C
+
+# Fixed-checkpoint RSGP component rows
+bash scripts/eval_predcls_rsgp_ablation.sh FULL
+bash scripts/eval_predcls_rsgp_ablation.sh NO_PPN
+bash scripts/eval_predcls_rsgp_ablation.sh NO_RS
+bash scripts/eval_predcls_rsgp_ablation.sh NO_DEGREE
+bash scripts/eval_predcls_rsgp_ablation.sh NO_QUOTA
+bash scripts/eval_predcls_rsgp_ablation.sh NO_TAIL
+
+# Cross-task fixed-checkpoint comparisons
+bash scripts/eval_cross_task_minimal.sh SGCLS_PPG
+bash scripts/eval_cross_task_minimal.sh SGCLS_RSGP
+bash scripts/eval_cross_task_minimal.sh SGDET_PPG
+bash scripts/eval_cross_task_minimal.sh SGDET_RSGP
+```
+
+Method definitions, formulas, current results, table provenance, and remaining
+TBD rows are recorded in
+[docs/paper_contributions_and_experiments.md](docs/paper_contributions_and_experiments.md).
+The RSGP design boundary is recorded in
+[docs/rsgp_technical_route.md](docs/rsgp_technical_route.md).
+
+## Diagnostics and tests
+
+```bash
+# Environment and rotated CUDA operators
+python tools/check_environment.py --strict --require-cuda
+
+# Object/detection error decomposition
+bash scripts/diagnose_star_object_classification.sh
+
+# Parse and plot a training log
+python scripts/plot_train_log_curves.py outputs/.../train.log
+
+# Optional test/plot dependencies, then the test suite
+pip install -r requirements.analysis.txt
+pytest -q
+```
+
+The complete clean-environment smoke evaluation is:
+
+```bash
+bash scripts/smoke_test_clean_env.sh
+```
 
 ## Reproducibility notes
 
-- The default STAR configuration disables cuDNN and uses deterministic settings.
-- Experiment artifacts are written below `outputs/` and are not versioned.
-- Record the exact Python, PyTorch, CUDA, and MMCV versions used for published results.
+- `FILTER_METHOD` must be one of `PPG`, `PPN`, or `RSGP`; unfiltered STAR
+  relation graphs are disabled because all-pairs inference can cause OOM.
+- PredCls HPRC excludes the constant GT object-refinement loss. SGCls and
+  SGDet explicitly retain trainable object-refinement CE.
+- `outputs/` is not versioned. Preserve checkpoint hashes, configs, logs, and
+  metric JSONs used for publication separately.
+- Existing historical HPRC results were warm-started from `6850_4135.pth`.
+  The current clean HPRC launcher is detector-only scratch training; do not
+  conflate the two training protocols.
 
 ## License
 
-No license has been selected yet. Add a `LICENSE` file before distributing the project if reuse terms should be granted.
+No license has been selected. Add a `LICENSE` file before public distribution.

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-pyg}"
+CONDA_ENV="${CONDA_ENV:-sgg}"
 DEVICE="${DEVICE:-cuda}"
 CONFIG="${CONFIG:-configs/star_predcls_obb_train.py}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_train}"
@@ -34,7 +34,7 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 STATUS_FILE="${OUTPUT_DIR}/exit_code.txt"
 PID_FILE="${OUTPUT_DIR}/train.pid"
-rm -f "${STATUS_FILE}"
+rm -f "${STATUS_FILE}" "${PID_FILE}"
 
 source "${CONDA_SH}"
 conda activate "${CONDA_ENV}"
@@ -54,25 +54,41 @@ fi
 
 if [[ -n "${RESUME}" ]]; then
   nohup bash -lc '
-    "$@"
+    set +e
+    "$@" &
+    child_pid=$!
+    printf "%s\n" "${child_pid}" > "'"${PID_FILE}"'"
+    wait "${child_pid}"
     status=$?
     printf "%s\n" "${status}" > "'"${STATUS_FILE}"'"
     exit "${status}"
   ' _ "${cmd[@]}" >> "${LOG_FILE}" 2>&1 &
 else
   nohup bash -lc '
-    "$@"
+    set +e
+    "$@" &
+    child_pid=$!
+    printf "%s\n" "${child_pid}" > "'"${PID_FILE}"'"
+    wait "${child_pid}"
     status=$?
     printf "%s\n" "${status}" > "'"${STATUS_FILE}"'"
     exit "${status}"
   ' _ "${cmd[@]}" > "${LOG_FILE}" 2>&1 &
 fi
 
-pid="$!"
-printf "%s\n" "${pid}" > "${PID_FILE}"
+wrapper_pid="$!"
+pid="${wrapper_pid}"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if [[ -s "${PID_FILE}" ]]; then
+    pid="$(cat "${PID_FILE}")"
+    break
+  fi
+  sleep 0.1
+done
 
 echo "Started STAR main experiment"
 echo "PID: ${pid}"
+echo "Wrapper PID: ${wrapper_pid}"
 echo "Config: ${CONFIG}"
 echo "Init RPCM: ${INIT_RPCM:-<none>}"
 echo "Resume: ${RESUME:-<none>}"

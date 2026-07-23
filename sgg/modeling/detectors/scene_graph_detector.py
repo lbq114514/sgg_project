@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -27,6 +28,12 @@ from sgg.modeling.detectors.class_channel_order import (
     normalize_detector_class_order,
     reorder_detector_classifier_rows,
 )
+from sgg.modeling.detectors.sgdet_detection_cache import (
+    load_sgdet_detection,
+    original_sgdet_score_keep,
+    resolve_sgdet_detection_cache_hash,
+    sgdet_detection_cache_path,
+)
 from sgg.structures.boxes import BoxList
 from sgg.structures.boxlist_ops import boxlist_iou
 
@@ -40,13 +47,19 @@ def _to_onehot_logits(labels: torch.Tensor, num_classes: int, fill: float = 1000
 
 
 class SceneGraphDetector(nn.Module):
-    """
-    A lightweight but image-grounded SGG detector.
+    """Unified public detector for the three STAR SGG tasks.
 
-    The detector has three pieces of real model logic:
-    - a CNN feature extractor
-    - a dense detection head for `sgdet`
-    - ROI-based object/node features for relation prediction
+    Task ownership is intentionally explicit:
+
+    * ``predcls``: GT boxes + GT object labels; predict predicates only.
+    * ``sgcls``: GT boxes; detector/refine heads predict object labels.
+    * ``sgdet``: frozen d1/d2 detector predicts boxes and object logits, then
+      the relation head predicts predicates on the filtered proposal graph.
+
+    ``SGDET_COMPAT.DETECTION_CACHE`` replaces only the expensive frozen
+    detector forward.  Cached proposals still pass through current label
+    assignment, pair filtering, late object NMS and relation prediction, so
+    cache use does not create a separate evaluation protocol.
     """
 
     def __init__(self, cfg: Dict):
@@ -122,6 +135,14 @@ class SceneGraphDetector(nn.Module):
         self.sgdet_patch_merge_nms_thresh = float(
             sgdet_cfg.get("PATCH_MERGE_NMS_THRESH", 0.4)
         )
+        self.sgdet_patch_debug = bool(sgdet_cfg.get("PATCH_DEBUG", False))
+        cache_cfg = dict(sgdet_cfg.get("DETECTION_CACHE", {}))
+        self.sgdet_detection_cache_enabled = bool(cache_cfg.get("ENABLED", False))
+        self.sgdet_detection_cache_dir = Path(
+            str(cache_cfg.get("DIR", "outputs/star_sgdet_detection_cache_v5"))
+        )
+        self.sgdet_detection_cache_require_hit = bool(cache_cfg.get("REQUIRE_HIT", True))
+        self.sgdet_detection_cache_hash = str(cache_cfg.get("HASH", "") or "")
         self.sgdet_train_label_source = str(sgdet_cfg.get("TRAIN_LABEL_SOURCE", "matched_gt")).lower()
         if self.sgdet_train_label_source not in {"matched_gt", "pred"}:
             raise ValueError(
@@ -133,7 +154,7 @@ class SceneGraphDetector(nn.Module):
                 "MODEL.SGDET_COMPAT.EVAL_LABEL_SOURCE must be 'matched_gt' or 'pred'."
             )
         self.sgdet_add_gtbox_to_proposal_train = bool(
-            sgdet_cfg.get("ADD_GTBOX_TO_PROPOSAL_IN_TRAIN", True)
+            sgdet_cfg.get("ADD_GTBOX_TO_PROPOSAL_IN_TRAIN", False)
         )
         rel_head_cfg = model_cfg.get("ROI_RELATION_HEAD", {})
         self.sgcls_filter_label_source = str(
@@ -206,6 +227,21 @@ class SceneGraphDetector(nn.Module):
 
         if self.sgdet_compat_enabled:
             self._configure_sgdet_compat_detector(sgdet_cfg)
+            print(
+                "[sgdet-protocol] "
+                f"train_gtbox_injection={self.sgdet_add_gtbox_to_proposal_train}, "
+                f"train_label_source={self.sgdet_train_label_source}, "
+                f"eval_label_source={self.sgdet_eval_label_source}",
+                flush=True,
+            )
+            if self.sgdet_detection_cache_enabled:
+                print(
+                    "[sgdet-cache] enabled "
+                    f"dir={self.sgdet_detection_cache_dir} "
+                    f"hash={resolve_sgdet_detection_cache_hash(self.cfg)} "
+                    f"require_hit={self.sgdet_detection_cache_require_hit}",
+                    flush=True,
+                )
 
         pretrained = model_cfg.get("PRETRAINED_DETECTOR", "")
         if pretrained:
@@ -467,7 +503,10 @@ class SceneGraphDetector(nn.Module):
             # a sampled detector RoI training branch.  Keep this whole path
             # inference-only; relation/union heads below remain trainable.
             with torch.no_grad():
-                if detector_images is not None:
+                proposals = self._try_load_sgdet_cached_proposals(targets)
+                if proposals is not None:
+                    pass
+                elif detector_images is not None:
                     proposals = self._detect_sgdet_raw_to_relation_view(
                         detector_images,
                         detector_targets,
@@ -651,6 +690,11 @@ class SceneGraphDetector(nn.Module):
                     proposal.add_field("labels", pred_labels)
             return proposals
 
+        proposals = self._try_load_sgdet_cached_proposals(targets)
+        if proposals is not None:
+            self._assign_sgdet_eval_labels(proposals, targets)
+            return proposals
+
         if detector_images is not None:
             proposals = self._detect_sgdet_raw_to_relation_view(
                 detector_images,
@@ -667,6 +711,103 @@ class SceneGraphDetector(nn.Module):
             images=images,
         )
         self._assign_sgdet_eval_labels(proposals, targets)
+        return proposals
+
+    def _sgdet_cache_preferred_split(self) -> str:
+        if self.training:
+            return "train"
+        return str(self.cfg.get("SOLVER", {}).get("VAL_SPLIT", "test")).lower()
+
+    @staticmethod
+    def _sgdet_image_id_from_target(target: Optional[BoxList]) -> Optional[int]:
+        if target is None or not target.has_field("image_id"):
+            return None
+        image_id = target.get_field("image_id")
+        if torch.is_tensor(image_id) and image_id.numel() > 0:
+            return int(image_id.reshape(-1)[0].item())
+        try:
+            return int(image_id)
+        except (TypeError, ValueError):
+            return None
+
+    def _sgdet_cache_candidate_paths(self, image_id: int, preferred_split: str) -> List[Path]:
+        splits = [preferred_split]
+        for split in ("train", "val", "test"):
+            if split not in splits:
+                splits.append(split)
+        return [
+            sgdet_detection_cache_path(self.sgdet_detection_cache_dir, split, image_id)
+            for split in splits
+        ]
+
+    def _try_load_sgdet_detection_cache(
+        self,
+        *,
+        image_id: Optional[int],
+        relation_size: Tuple[int, int],
+        device: torch.device,
+    ) -> Optional[BoxList]:
+        if not self.sgdet_detection_cache_enabled:
+            return None
+        if image_id is None:
+            message = "sgdet detection cache is enabled but target image_id is unavailable"
+            if self.sgdet_detection_cache_require_hit:
+                raise RuntimeError(message)
+            print(f"[sgdet-cache] {message}; falling back to detector", flush=True)
+            return None
+        preferred_split = self._sgdet_cache_preferred_split()
+        candidates = self._sgdet_cache_candidate_paths(int(image_id), preferred_split)
+        existing = [path for path in candidates if path.exists()]
+        if not existing:
+            message = (
+                f"sgdet detection cache miss for image_id={image_id}; "
+                f"checked={[str(path) for path in candidates]}"
+            )
+            if self.sgdet_detection_cache_require_hit:
+                raise FileNotFoundError(message)
+            print(f"[sgdet-cache] {message}; falling back to detector", flush=True)
+            return None
+        path = existing[0]
+        try:
+            return load_sgdet_detection(
+                path,
+                cfg=self.cfg,
+                device=device,
+                expected_image_id=int(image_id),
+                expected_relation_size=relation_size,
+            )
+        except Exception:
+            if self.sgdet_detection_cache_require_hit:
+                raise
+            print(
+                f"[sgdet-cache] failed to load {path}; falling back to detector",
+                flush=True,
+            )
+            return None
+
+    def _try_load_sgdet_cached_proposals(
+        self,
+        targets: Optional[Sequence[BoxList]],
+    ) -> Optional[List[BoxList]]:
+        if not self.sgdet_detection_cache_enabled:
+            return None
+        if targets is None:
+            message = "sgdet detection cache requires targets with image_id and relation size"
+            if self.sgdet_detection_cache_require_hit:
+                raise RuntimeError(message)
+            print(f"[sgdet-cache] {message}; falling back to detector", flush=True)
+            return None
+        proposals: List[BoxList] = []
+        for target in targets:
+            image_id = self._sgdet_image_id_from_target(target)
+            proposal = self._try_load_sgdet_detection_cache(
+                image_id=image_id,
+                relation_size=tuple(int(v) for v in target.size),
+                device=target.bbox.device,
+            )
+            if proposal is None:
+                return None
+            proposals.append(proposal)
         return proposals
 
     @torch.no_grad()
@@ -699,6 +840,7 @@ class SceneGraphDetector(nn.Module):
 
         outputs: List[BoxList] = []
         for index in range(batch_size):
+            image_start = time.perf_counter()
             if detector_targets is not None:
                 raw_target = detector_targets[index]
                 raw_size = raw_target.size if isinstance(raw_target, BoxList) else tuple(raw_target)
@@ -709,7 +851,40 @@ class SceneGraphDetector(nn.Module):
                     int(detector_image_list[index].shape[-1]),
                 )
                 raw_size = (raw_w, raw_h)
+            relation_size = (
+                relation_targets[index].size if relation_targets is not None else raw_size
+            )
+            relation_device = (
+                relation_targets[index].bbox.device
+                if relation_targets is not None
+                else self._detector_device()
+            )
+            image_id = (
+                self._sgdet_image_id_from_target(relation_targets[index])
+                if relation_targets is not None
+                else None
+            )
+            cached = self._try_load_sgdet_detection_cache(
+                image_id=image_id,
+                relation_size=tuple(int(v) for v in relation_size),
+                device=relation_device,
+            )
+            if cached is not None:
+                outputs.append(cached)
+                if self.sgdet_patch_debug:
+                    print(
+                        f"[sgdet-cache] image {index + 1}/{batch_size} "
+                        f"image_id={image_id} detections={len(cached)}",
+                        flush=True,
+                    )
+                continue
             raw_image = detector_image_list[index][:, :raw_h, :raw_w]
+            if self.sgdet_patch_debug:
+                print(
+                    f"[sgdet-detector] image {index + 1}/{batch_size} "
+                    f"raw_hw=({raw_h},{raw_w}) relation_size={relation_size}",
+                    flush=True,
+                )
             if self.patch_auto_enabled and self._should_use_patch_inference(raw_image.unsqueeze(0)):
                 detection = self._detect_single_image_multiscale(raw_image)
             else:
@@ -723,14 +898,6 @@ class SceneGraphDetector(nn.Module):
                     use_d2=False,
                 )[0]
 
-            relation_size = (
-                relation_targets[index].size if relation_targets is not None else raw_size
-            )
-            relation_device = (
-                relation_targets[index].bbox.device
-                if relation_targets is not None
-                else self._detector_device()
-            )
             if detection.bbox.device != relation_device:
                 detection = detection.to(relation_device)
             if tuple(detection.size) != tuple(relation_size):
@@ -738,6 +905,12 @@ class SceneGraphDetector(nn.Module):
                     detection,
                     source_size=detection.size,
                     target_size=relation_size,
+                )
+            if self.sgdet_patch_debug:
+                print(
+                    f"[sgdet-detector] image {index + 1}/{batch_size} "
+                    f"detections={len(detection)} seconds={time.perf_counter() - image_start:.2f}",
+                    flush=True,
                 )
             outputs.append(detection)
         return outputs
@@ -1019,8 +1192,9 @@ class SceneGraphDetector(nn.Module):
 
         The source detector uses d1 alone for images that fit one 1024 patch.
         For a larger image it starts at the first half-resolution level with
-        d1 and assigns d2 to each subsequent (smaller) pyramid level.  It does
-        not run both copies on every patch/scale.
+        d1 and assigns d2 to each subsequent (smaller) pyramid level.  On the
+        first half-resolution level, selected tiles additionally trigger the
+        source detector's four original-resolution d1 refinement patches.
         """
         _, h, w = image.shape
         scale_specs: List[Tuple[int, int, bool]] = []
@@ -1035,8 +1209,10 @@ class SceneGraphDetector(nn.Module):
                 max(cur_h, cur_w) > self.patch_auto_min_size
                 and level < self.patch_max_pyramid_layers
             ):
-                next_h = max(int(round(cur_h * self.sgdet_d2_scale)), 1)
-                next_w = max(int(round(cur_w * self.sgdet_d2_scale)), 1)
+                # The source uses integer right shifts for its 0.5 pyramid,
+                # hence floor rather than round for odd image dimensions.
+                next_h = max(int(cur_h * self.sgdet_d2_scale), 1)
+                next_w = max(int(cur_w * self.sgdet_d2_scale), 1)
                 # The source default is 0.5.  Preserve progress for an
                 # explicitly supplied scale=1 compatibility/debug setting.
                 if next_h >= cur_h and next_w >= cur_w:
@@ -1045,8 +1221,15 @@ class SceneGraphDetector(nn.Module):
                 cur_h, cur_w = next_h, next_w
                 scale_specs.append((cur_h, cur_w, bool(self.sgdet_use_d2 and level > 0)))
                 level += 1
+        if self.sgdet_patch_debug:
+            print(
+                "[sgdet-patch] multiscale "
+                f"source_hw=({h},{w}) scales={scale_specs}",
+                flush=True,
+            )
         all_detections: List[BoxList] = []
-        for scaled_h, scaled_w, use_d2 in scale_specs:
+        for level, (scaled_h, scaled_w, use_d2) in enumerate(scale_specs):
+            scale_start = time.perf_counter()
             if scaled_h == h and scaled_w == w:
                 scaled = image
             else:
@@ -1055,12 +1238,28 @@ class SceneGraphDetector(nn.Module):
                 scaled,
                 original_size=(w, h),
                 use_d2=use_d2,
+                full_resolution_image=(
+                    image
+                    if level == 0 and not use_d2 and (scaled_h != h or scaled_w != w)
+                    else None
+                ),
             )
             if len(det) > 0:
                 all_detections.append(det)
+            if self.sgdet_patch_debug:
+                print(
+                    "[sgdet-patch] scale_done "
+                    f"scaled_hw=({scaled_h},{scaled_w}) use_d2={use_d2} "
+                    f"detections={len(det)} seconds={time.perf_counter() - scale_start:.2f}",
+                    flush=True,
+                )
         if not all_detections:
             return BoxList(image.new_zeros((0, 5)), (w, h), "xywha")
-        return self._merge_patch_detections(all_detections, (w, h))
+        return self._merge_patch_detections(
+            all_detections,
+            (w, h),
+            apply_original_score_filter=self.sgdet_compat_enabled,
+        )
 
     def _detect_single_scale_patches(
         self,
@@ -1068,6 +1267,7 @@ class SceneGraphDetector(nn.Module):
         original_size: Tuple[int, int],
         *,
         use_d2: bool = False,
+        full_resolution_image: Optional[torch.Tensor] = None,
     ) -> BoxList:
         _, scaled_h, scaled_w = image.shape
         patch_h, patch_w = self.patch_size
@@ -1086,7 +1286,15 @@ class SceneGraphDetector(nn.Module):
                 metas.append({"x0": x0, "y0": y0, "width": x1 - x0, "height": y1 - y0})
         detections: List[BoxList] = []
         batch_size = self.patch_batch_size_large if max(original_size[0], original_size[1]) <= 10000 else self.patch_batch_size
+        if self.sgdet_patch_debug:
+            print(
+                "[sgdet-patch] scale_start "
+                f"scaled_hw=({scaled_h},{scaled_w}) patches={len(patches)} "
+                f"patch_batch={batch_size} use_d2={use_d2}",
+                flush=True,
+            )
         for start in range(0, len(patches), batch_size):
+            patch_batch_start = time.perf_counter()
             batch_patches = patches[start : start + batch_size]
             batch_metas = metas[start : start + batch_size]
             # ``image`` may deliberately remain on CPU when it is a full
@@ -1106,9 +1314,112 @@ class SceneGraphDetector(nn.Module):
             )
             for det, meta in zip(patch_dets, batch_metas):
                 detections.append(self._relocate_patch_detection(det, meta, (scaled_w, scaled_h), original_size))
+            if full_resolution_image is not None:
+                trigger_metas = [
+                    meta
+                    for det, meta in zip(patch_dets, batch_metas)
+                    if self._sgdet_scale2_refinement_trigger(det)
+                ]
+                detections.extend(
+                    self._detect_scale2_full_resolution_refinements(
+                        full_resolution_image,
+                        trigger_metas,
+                        scaled_size=(scaled_w, scaled_h),
+                        original_size=original_size,
+                    )
+                )
+            if self.sgdet_patch_debug:
+                done = min(start + batch_size, len(patches))
+                print(
+                    "[sgdet-patch] patch_batch_done "
+                    f"{done}/{len(patches)} use_d2={use_d2} "
+                    f"seconds={time.perf_counter() - patch_batch_start:.2f}",
+                    flush=True,
+                )
         if not detections:
             return BoxList(image.new_zeros((0, 5)), original_size, "xywha")
         return self._merge_patch_detections(detections, original_size)
+
+    @staticmethod
+    def _sgdet_scale2_refinement_trigger(detection: BoxList) -> bool:
+        """Match the source detector's ``res_list[0]`` scale=2 trigger."""
+        if len(detection) == 0:
+            return False
+        if detection.has_field("detector_nms_labels"):
+            labels = detection.get_field("detector_nms_labels")
+            return bool((labels == 0).any().item())
+        if detection.has_field("pred_labels"):
+            return bool((detection.get_field("pred_labels") == 1).any().item())
+        return False
+
+    def _detect_scale2_full_resolution_refinements(
+        self,
+        image: torch.Tensor,
+        trigger_metas: Sequence[Dict[str, int]],
+        *,
+        scaled_size: Tuple[int, int],
+        original_size: Tuple[int, int],
+    ) -> List[BoxList]:
+        """Run the original four d1 sub-patches for triggered scale=2 tiles.
+
+        The half-resolution d1 pass supplies coarse detections.  When the
+        first detector class bucket is present, the source STAR detector
+        revisits the corresponding 2x2 area at original resolution.  This is
+        essential for retaining small objects in large remote-sensing scenes.
+        """
+        if not trigger_metas:
+            return []
+        _, raw_h, raw_w = image.shape
+        patch_h, patch_w = self.patch_size
+        scale_x = float(original_size[0]) / float(max(scaled_size[0], 1))
+        scale_y = float(original_size[1]) / float(max(scaled_size[1], 1))
+        patches: List[torch.Tensor] = []
+        metas: List[Dict[str, int]] = []
+        for trigger in trigger_metas:
+            base_x = int(round(float(trigger["x0"]) * scale_x))
+            base_y = int(round(float(trigger["y0"]) * scale_y))
+            for dy in (0, patch_h):
+                for dx in (0, patch_w):
+                    x0 = base_x + dx
+                    y0 = base_y + dy
+                    if x0 >= raw_w or y0 >= raw_h:
+                        continue
+                    x1 = min(x0 + patch_w, raw_w)
+                    y1 = min(y0 + patch_h, raw_h)
+                    patches.append(image[:, y0:y1, x0:x1])
+                    metas.append(
+                        {"x0": x0, "y0": y0, "width": x1 - x0, "height": y1 - y0}
+                    )
+
+        detections: List[BoxList] = []
+        batch_size = max(min(int(self.patch_batch_size_large), 4), 1)
+        for start in range(0, len(patches), batch_size):
+            batch_patches = patches[start : start + batch_size]
+            batch_metas = metas[start : start + batch_size]
+            batch_tensor = pad_images(batch_patches, size_divisible=32).to(self._detector_device())
+            batch_features = self._extract_features(batch_tensor)
+            patch_dets = self._detect_sgdet_detector_branch(
+                batch_features,
+                image_hw=(batch_tensor.shape[-2], batch_tensor.shape[-1]),
+                device=self._detector_device(),
+                use_d2=False,
+            )
+            for det, meta in zip(patch_dets, batch_metas):
+                detections.append(
+                    self._relocate_patch_detection(
+                        det,
+                        meta,
+                        original_size,
+                        original_size,
+                    )
+                )
+        if self.sgdet_patch_debug and detections:
+            print(
+                "[sgdet-patch] scale2_d1_refinement "
+                f"triggers={len(trigger_metas)} patches={len(detections)}",
+                flush=True,
+            )
+        return detections
 
     def _relocate_patch_detection(
         self,
@@ -1130,15 +1441,44 @@ class SceneGraphDetector(nn.Module):
         relocated = BoxList(boxes, original_size, det.mode)
         for field in det.fields():
             value = det.get_field(field)
-            if torch.is_tensor(value):
+            if field == "boxes_per_cls" and torch.is_tensor(value):
+                # ``boxes_per_cls`` uses the same patch-local coordinate frame
+                # as ``det.bbox``.  RelationPostProcessor selects one of these
+                # boxes for sgdet, so leaving this field patch-local silently
+                # replaces the correctly relocated main bbox during eval.
+                value = value.clone()
+                if value.numel() > 0 and value.size(-1) >= 4:
+                    value[..., 0] += float(meta["x0"])
+                    value[..., 1] += float(meta["y0"])
+                    value[..., 0] *= sx
+                    value[..., 1] *= sy
+                    value[..., 2] *= sx
+                    value[..., 3] *= sy
+            elif torch.is_tensor(value):
                 value = value.clone()
             relocated.add_field(field, value)
         return relocated
 
-    def _merge_patch_detections(self, detections: Sequence[BoxList], size: Tuple[int, int]) -> BoxList:
+    def _merge_patch_detections(
+        self,
+        detections: Sequence[BoxList],
+        size: Tuple[int, int],
+        *,
+        apply_original_score_filter: bool = False,
+    ) -> BoxList:
         boxes = torch.cat([det.bbox for det in detections], dim=0) if detections else torch.zeros((0, 5))
         pred_scores = torch.cat([det.get_field("pred_scores") for det in detections], dim=0) if detections else torch.zeros((0,))
         pred_labels = torch.cat([det.get_field("pred_labels") for det in detections], dim=0) if detections else torch.zeros((0,), dtype=torch.long)
+        detector_nms_scores = (
+            torch.cat([det.get_field("detector_nms_scores") for det in detections], dim=0)
+            if detections and all(det.has_field("detector_nms_scores") for det in detections)
+            else pred_scores
+        )
+        detector_nms_labels = (
+            torch.cat([det.get_field("detector_nms_labels") for det in detections], dim=0)
+            if detections and all(det.has_field("detector_nms_labels") for det in detections)
+            else (pred_labels - 1).clamp(min=0)
+        )
         predict_logits = torch.cat([det.get_field("predict_logits") for det in detections], dim=0) if detections else torch.zeros((0, self.num_classes))
         boxes_per_cls = (
             torch.cat([det.get_field("boxes_per_cls") for det in detections], dim=0)
@@ -1150,7 +1490,9 @@ class SceneGraphDetector(nn.Module):
             set_boxlist_angle_unit(empty, self.obb_angle_unit)
             empty.add_field("pred_labels", pred_labels)
             empty.add_field("pred_scores", pred_scores)
-            empty.add_field("scores", pred_scores)
+            empty.add_field("detector_nms_labels", detector_nms_labels.long())
+            empty.add_field("detector_nms_scores", detector_nms_scores)
+            empty.add_field("scores", detector_nms_scores)
             empty.add_field("predict_logits", predict_logits)
             empty.add_field("pred_logits", predict_logits)
             empty.add_field("labels", pred_labels)
@@ -1166,7 +1508,7 @@ class SceneGraphDetector(nn.Module):
         else:
             keep = None
             for thresh in self.patch_score_thresholds:
-                cur_keep = torch.nonzero(pred_scores >= thresh, as_tuple=False).flatten()
+                cur_keep = torch.nonzero(detector_nms_scores >= thresh, as_tuple=False).flatten()
                 if cur_keep.numel() > 0:
                     keep = cur_keep
                     break
@@ -1175,34 +1517,63 @@ class SceneGraphDetector(nn.Module):
         boxes = boxes[keep]
         pred_scores = pred_scores[keep]
         pred_labels = pred_labels[keep]
+        detector_nms_scores = detector_nms_scores[keep]
+        detector_nms_labels = detector_nms_labels[keep]
         predict_logits = predict_logits[keep]
         if boxes_per_cls is not None:
             boxes_per_cls = boxes_per_cls[keep]
         _, keep_nms = batched_nms(
             boxes,
-            pred_scores,
-            pred_labels,
+            detector_nms_scores,
+            detector_nms_labels,
             self.sgdet_patch_merge_nms_thresh if self.sgdet_compat_enabled else self.nms_thresh,
             mode="obb",
             obb_fallback_to_hbb=self.obb_fallback_to_hbb,
             angle_unit=self.obb_angle_unit,
         )
-        if self.sgdet_compat_enabled:
-            # The original implementation applies the RCNN max-per-image cap
-            # before merging.  Applying the same cap again after relocation
-            # keeps the public relation path memory-bounded for many patches.
-            keep_nms = keep_nms[: self.sgdet_rcnn_max_per_img]
+        # Match the original ``merge_results_two_stage`` contract: the RoI
+        # head applies ``max_per_img`` inside each patch, while the cross-patch
+        # class-wise NMS returns every surviving detection.  A second global
+        # ``RCNN_MAX_PER_IMG`` truncation here disproportionately removes
+        # low-score objects from dense STAR scenes and places an artificial
+        # ceiling on sgdet relation recall.
         boxes = boxes[keep_nms]
         pred_scores = pred_scores[keep_nms]
         pred_labels = pred_labels[keep_nms]
+        detector_nms_scores = detector_nms_scores[keep_nms]
+        detector_nms_labels = detector_nms_labels[keep_nms]
         predict_logits = predict_logits[keep_nms]
         if boxes_per_cls is not None:
             boxes_per_cls = boxes_per_cls[keep_nms]
+        if apply_original_score_filter:
+            # The source detector applies its 0.3 -> ... fallback once, after
+            # all patch and pyramid results have been merged.  Applying it in
+            # the per-scale merges would discard boxes before the final merge
+            # and would therefore not be equivalent.
+            score_keep = original_sgdet_score_keep(
+                detector_nms_scores,
+                detector_nms_labels,
+                self.patch_score_thresholds,
+            )
+            boxes = boxes[score_keep]
+            pred_scores = pred_scores[score_keep]
+            pred_labels = pred_labels[score_keep]
+            detector_nms_scores = detector_nms_scores[score_keep]
+            detector_nms_labels = detector_nms_labels[score_keep]
+            predict_logits = predict_logits[score_keep]
+            if boxes_per_cls is not None:
+                boxes_per_cls = boxes_per_cls[score_keep]
+        # The original detector keeps the class-specific NMS bucket for box
+        # merging, then derives the relation-view object class from the
+        # preserved full logits.  Do that only after all patch filtering.
+        pred_labels, pred_scores = self._decode_object_logits(predict_logits)
         merged = BoxList(boxes, size, "xywha")
         set_boxlist_angle_unit(merged, self.obb_angle_unit)
         merged.add_field("pred_labels", pred_labels.long())
         merged.add_field("pred_scores", pred_scores)
-        merged.add_field("scores", pred_scores)
+        merged.add_field("detector_nms_labels", detector_nms_labels.long())
+        merged.add_field("detector_nms_scores", detector_nms_scores)
+        merged.add_field("scores", detector_nms_scores)
         merged.add_field("predict_logits", predict_logits)
         merged.add_field("pred_logits", predict_logits)
         merged.add_field("labels", pred_labels.long())
@@ -1282,6 +1653,10 @@ class SceneGraphDetector(nn.Module):
             aspect_ratios=ratios,
             strides=tuple(int(self.feature_stride_map[key]) for key in self.feature_keys),
             mode="hbb",
+            # The source mmdet AnchorGenerator uses center_offset=0.0.  Keep
+            # this explicit because its pretrained midpoint-offset RPN deltas
+            # are tied to the exact anchor grid.
+            offset=float(sgdet_cfg.get("RPN_ANCHOR_OFFSET", 0.0)),
         )
         self.sgdet_rpn_bbox_coder = UnifiedBoxCoder(
             mode="midpointoffset",
@@ -1399,6 +1774,8 @@ class SceneGraphDetector(nn.Module):
             dets = dets[: self.sgdet_rcnn_max_per_img]
             selected_sources = source_indices[keep]
             selected_logits = logits[selected_sources]
+            detector_nms_labels = labels[keep]
+            detector_nms_scores = dets[:, 5]
             pred_labels, pred_scores = self._decode_object_logits(selected_logits)
             result = BoxList(dets[:, :5], proposal.size, "xywha")
             set_boxlist_angle_unit(result, self.obb_angle_unit)
@@ -1406,7 +1783,9 @@ class SceneGraphDetector(nn.Module):
             result.add_field("pred_logits", selected_logits)
             result.add_field("pred_labels", pred_labels)
             result.add_field("pred_scores", pred_scores)
-            result.add_field("scores", dets[:, 5])
+            result.add_field("detector_nms_labels", detector_nms_labels.long())
+            result.add_field("detector_nms_scores", detector_nms_scores)
+            result.add_field("scores", detector_nms_scores)
             result.add_field("labels", pred_labels)
             result.add_field("boxes_per_cls", decoded[selected_sources, None, :].expand(-1, self.num_classes, -1))
             result.add_field("pair_labels", torch.zeros((len(result), len(result)), dtype=torch.long, device=dets.device))
@@ -1421,6 +1800,8 @@ class SceneGraphDetector(nn.Module):
         result.add_field("pred_logits", result.get_field("predict_logits"))
         result.add_field("pred_labels", torch.zeros((0,), dtype=torch.long, device=device))
         result.add_field("pred_scores", torch.zeros((0,), dtype=torch.float32, device=device))
+        result.add_field("detector_nms_labels", torch.zeros((0,), dtype=torch.long, device=device))
+        result.add_field("detector_nms_scores", torch.zeros((0,), dtype=torch.float32, device=device))
         result.add_field("scores", torch.zeros((0,), dtype=torch.float32, device=device))
         result.add_field("labels", torch.zeros((0,), dtype=torch.long, device=device))
         result.add_field("boxes_per_cls", torch.zeros((0, self.num_classes, 5), dtype=torch.float32, device=device))
@@ -1784,6 +2165,11 @@ class SceneGraphDetector(nn.Module):
             num_classes=int(model_cfg.get("ROI_BOX_HEAD", {}).get("NUM_CLASSES", self.num_classes)),
             reg_class_agnostic=True,
             bbox_coder=DeltaXYWHAOBBoxCoder(
+                target_means=(0.0, 0.0, 0.0, 0.0, 0.0),
+                # OBB_swin_L_OBD.pth was trained with mmrotate's standard
+                # rotated RoI bbox normalization.  Unit stds decode the
+                # frozen regressor at the wrong scale.
+                target_stds=(0.1, 0.1, 0.2, 0.2, 0.1),
                 angle_range=model_cfg.get("ANGLE_VERSION", "le90"),
                 edge_swap=True,
                 proj_xy=True,

@@ -5,7 +5,109 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
+from sgg.modeling.core.obb_ops import get_boxlist_angle_unit, set_boxlist_angle_unit
 from sgg.structures.boxes import BoxList
+from sgg.structures.boxlist_ops import boxlist_iou
+
+
+def obj_prediction_nms(
+    proposal: BoxList,
+    boxes_per_cls: torch.Tensor,
+    pred_logits: torch.Tensor,
+    nms_thresh: float = 0.3,
+) -> torch.Tensor:
+    """Memory-bounded equivalent of the original RPCM late object NMS.
+
+    The source implementation materializes ``N x N x C`` overlaps.  This
+    implementation preserves its global score ordering and per-class
+    suppression without constructing that tensor, which matters for dense
+    STAR sgdet proposals.
+    """
+    num_obj, num_cls = pred_logits.shape
+    if num_obj == 0:
+        return pred_logits.new_zeros((0,), dtype=torch.long)
+    if boxes_per_cls.shape[:2] != (num_obj, num_cls):
+        raise ValueError(
+            "boxes_per_cls must have shape [num_obj, num_cls, box_dim], "
+            f"got {tuple(boxes_per_cls.shape)} for logits {tuple(pred_logits.shape)}"
+        )
+
+    probabilities = F.softmax(pred_logits, dim=1).clone()
+    probabilities[:, 0] = 0.0
+    order = torch.argsort(probabilities.reshape(-1), descending=True).cpu().tolist()
+    # The greedy bookkeeping is tiny and intentionally kept on CPU.  Python
+    # indexing into CUDA booleans would otherwise synchronize once per
+    # candidate and make late NMS unusably slow.
+    assigned = torch.zeros((num_obj,), dtype=torch.bool)
+    suppressed = torch.zeros((num_obj, num_cls), dtype=torch.bool)
+    pred_labels = torch.zeros((num_obj,), dtype=torch.long)
+    box_mode = proposal.mode
+    angle_unit = get_boxlist_angle_unit(proposal, "degree")
+
+    # This STAR detector is class-agnostic for box regression, so every class
+    # channel normally contains the same box.  Compute the N x N overlap once
+    # in bounded row chunks and keep only a boolean CPU matrix, instead of the
+    # source implementation's N x N x C float tensor.
+    class_agnostic = torch.equal(
+        boxes_per_cls,
+        boxes_per_cls[:, :1, :].expand_as(boxes_per_cls),
+    )
+    shared_overlaps = None
+    if class_agnostic:
+        candidates = BoxList(boxes_per_cls[:, 0], proposal.size, box_mode)
+        if box_mode == "xywha":
+            set_boxlist_angle_unit(candidates, angle_unit)
+        overlap_rows = []
+        for start in range(0, num_obj, 256):
+            rows = BoxList(
+                boxes_per_cls[start : start + 256, 0], proposal.size, box_mode
+            )
+            if box_mode == "xywha":
+                set_boxlist_angle_unit(rows, angle_unit)
+            overlap_rows.append(
+                (boxlist_iou(rows, candidates, mode="auto") >= float(nms_thresh))
+                .cpu()
+            )
+        shared_overlaps = torch.cat(overlap_rows, dim=0)
+        if box_mode == "xywha":
+            # Preserve SGG-Toolkit's OBB implementation exactly: its
+            # nms_overlaps_rotated fills only i<j entries.  Although unusual,
+            # this ordering is part of the reported sgdet behavior.
+            indices = torch.arange(num_obj)
+            shared_overlaps &= indices[None, :] > indices[:, None]
+
+    for flat_index in order:
+        box_index = int(flat_index // num_cls)
+        class_index = int(flat_index % num_cls)
+        if class_index == 0 or assigned[box_index] or suppressed[box_index, class_index]:
+            continue
+        pred_labels[box_index] = class_index
+        assigned[box_index] = True
+
+        if shared_overlaps is not None:
+            overlap_mask = shared_overlaps[box_index]
+        else:
+            chosen = BoxList(
+                boxes_per_cls[box_index : box_index + 1, class_index],
+                proposal.size,
+                box_mode,
+            )
+            candidates = BoxList(
+                boxes_per_cls[:, class_index], proposal.size, box_mode
+            )
+            if box_mode == "xywha":
+                set_boxlist_angle_unit(chosen, angle_unit)
+                set_boxlist_angle_unit(candidates, angle_unit)
+            overlap_mask = (
+                boxlist_iou(chosen, candidates, mode="auto").squeeze(0)
+                >= float(nms_thresh)
+            ).cpu()
+            if box_mode == "xywha":
+                overlap_mask &= torch.arange(num_obj) > box_index
+        suppressed[:, class_index] |= overlap_mask
+        if bool(assigned.all()):
+            break
+    return pred_labels.to(pred_logits.device)
 
 
 class RelationPostProcessor:
@@ -14,6 +116,14 @@ class RelationPostProcessor:
         rel_cfg = cfg["MODEL"]["ROI_RELATION_HEAD"]
         self.use_gt_box = bool(rel_cfg.get("USE_GT_BOX", False))
         self.pairness_score_weight = float(rel_cfg.get("HIER_PAIRNESS_SCORE_WEIGHT", 0.0))
+        self.later_nms_pred_thres = float(
+            rel_cfg.get(
+                "LATER_NMS_PREDICTION_THRES",
+                cfg.get("TEST", {})
+                .get("RELATION", {})
+                .get("LATER_NMS_PREDICTION_THRES", 0.3),
+            )
+        )
 
     def _split_relation_logits(self, relation_logits, rel_pair_idxs):
         if isinstance(relation_logits, torch.Tensor):
@@ -50,8 +160,17 @@ class RelationPostProcessor:
             obj_class_prob = obj_class_prob.clone()
             obj_class_prob[:, 0] = 0.0
 
-        obj_scores, obj_pred = obj_class_prob[:, 1:].max(dim=1)
-        obj_pred = obj_pred + 1
+        if not self.use_gt_box and proposal.has_field("boxes_per_cls") and len(proposal) > 0:
+            obj_pred = obj_prediction_nms(
+                proposal,
+                proposal.get_field("boxes_per_cls"),
+                obj_logit,
+                self.later_nms_pred_thres,
+            )
+            obj_scores = obj_class_prob.gather(1, obj_pred[:, None]).squeeze(1)
+        else:
+            obj_scores, obj_pred = obj_class_prob[:, 1:].max(dim=1)
+            obj_pred = obj_pred + 1
         boxlist = proposal
 
         if not self.use_gt_box and proposal.has_field("boxes_per_cls") and len(proposal) > 0:

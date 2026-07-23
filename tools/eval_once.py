@@ -1,3 +1,10 @@
+"""Evaluate one checkpoint on one split without hidden experiment defaults.
+
+The shell wrappers ``eval_star_{predcls,sgcls,sgdet}.sh`` provide task-specific
+defaults.  This lower-level entry intentionally requires config/checkpoint and
+supports ``--max-images`` for deterministic smoke tests.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -87,6 +94,12 @@ def parse_args():
             "model-only: load only model tensors; "
             "legacy-rpcm: model-only plus safe key remaps for original RPCM checkpoints."
         ),
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=-1,
+        help="Optional deterministic prefix limit for smoke evaluation.",
     )
     return parser.parse_args()
 
@@ -355,7 +368,11 @@ def main():
     else:
         raise ValueError(f"Unknown checkpoint load mode: {args.checkpoint_load_mode}")
 
-    metrics, _ = trainer.evaluate_loader(dataloaders[split], return_result=True)
+    metrics, _ = trainer.evaluate_loader(
+        dataloaders[split],
+        return_result=True,
+        max_images=int(args.max_images),
+    )
 
     if args.output:
         output_path = Path(args.output)
@@ -366,6 +383,7 @@ def main():
                     "config": str(Path(args.config).resolve()),
                     "checkpoint": str(Path(args.checkpoint).resolve()),
                     "split": split,
+                    "max_images": int(args.max_images),
                     "metrics": metrics,
                 },
                 ensure_ascii=False,

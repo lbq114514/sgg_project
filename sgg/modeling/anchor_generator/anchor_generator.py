@@ -24,7 +24,8 @@ class AnchorGenerator:
         mode (str):
             "hbb" or "obb"
         offset (float):
-            Center offset in [0, 1]. Usually 0.5.
+            Center offset in [0, 1].  The mmdet/mmrotate AnchorGenerator
+            used by the STAR detector defaults to 0.0.
     """
 
     def __init__(
@@ -34,7 +35,7 @@ class AnchorGenerator:
         strides=(4, 8, 16, 32, 64),
         angles=(0.0,),
         mode="hbb",
-        offset=0.5,
+        offset=0.0,
     ):
         if mode not in ("hbb", "obb"):
             raise ValueError(f"Unsupported mode: {mode}")

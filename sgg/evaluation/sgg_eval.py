@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
+from sgg.modeling.core.obb_ops import get_boxlist_angle_unit, set_boxlist_angle_unit
 from sgg.structures.boxes import BoxList
 from sgg.structures.boxlist_ops import boxlist_iou
 
@@ -54,6 +55,8 @@ class _ImageContext:
     pred_obj_labels: torch.Tensor
     pred_obj_scores: torch.Tensor
     pred_boxes: torch.Tensor
+    gt_angle_unit: str
+    pred_angle_unit: str
     gt_pair_set: Set[Tuple[int, int]]
 
 
@@ -148,7 +151,12 @@ def _triplet(
     return triplets, triplet_boxes, triplet_scores
 
 
-def _pairwise_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+def _pairwise_iou(
+    boxes1: torch.Tensor,
+    boxes2: torch.Tensor,
+    angle_unit1: str = "degree",
+    angle_unit2: Optional[str] = None,
+) -> torch.Tensor:
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return _empty_float((boxes1.size(0), boxes2.size(0)))
 
@@ -158,6 +166,8 @@ def _pairwise_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         try:
             boxlist1 = BoxList(boxes1, (1, 1), mode=mode)
             boxlist2 = BoxList(boxes2, (1, 1), mode=mode)
+            set_boxlist_angle_unit(boxlist1, angle_unit1)
+            set_boxlist_angle_unit(boxlist2, angle_unit2 or angle_unit1)
             return boxlist_iou(boxlist1, boxlist2, mode="auto")
         except Exception:
             half_w1 = boxes1[:, 2] * 0.5
@@ -187,6 +197,8 @@ def _compute_pred_matches(
     iou_thresh: float,
     use_gt_boxes: bool = False,
     atol: float = 1e-4,
+    gt_angle_unit: str = "degree",
+    pred_angle_unit: Optional[str] = None,
 ) -> List[List[int]]:
     if pred_triplets.numel() == 0:
         return []
@@ -213,8 +225,12 @@ def _compute_pred_matches(
             pred_sub = pred_triplet_boxes[pred_match, :box_dim]
             pred_obj = pred_triplet_boxes[pred_match, box_dim:]
 
-            sub_iou = _pairwise_iou(gt_sub, pred_sub).squeeze(0)
-            obj_iou = _pairwise_iou(gt_obj, pred_obj).squeeze(0)
+            sub_iou = _pairwise_iou(
+                gt_sub, pred_sub, gt_angle_unit, pred_angle_unit
+            ).squeeze(0)
+            obj_iou = _pairwise_iou(
+                gt_obj, pred_obj, gt_angle_unit, pred_angle_unit
+            ).squeeze(0)
             keep = (sub_iou >= iou_thresh) & (obj_iou >= iou_thresh)
         for pred_idx in pred_match[keep].tolist():
             pred_to_gt[pred_idx].append(gt_idx)
@@ -265,6 +281,10 @@ def _build_image_context(pred: BoxList, target: BoxList, mode: str) -> Optional[
         pred_obj_labels=pred_obj_labels,
         pred_obj_scores=pred_obj_scores,
         pred_boxes=pred_boxes,
+        gt_angle_unit=get_boxlist_angle_unit(target, "degree"),
+        pred_angle_unit=get_boxlist_angle_unit(
+            pred_boxlist, get_boxlist_angle_unit(target, "degree")
+        ),
         gt_pair_set=gt_pair_set,
     )
 
@@ -358,6 +378,8 @@ def _match_predictions(
         pred_triplet_boxes=pred_triplet_boxes,
         iou_thresh=iou_thresh,
         use_gt_boxes=use_gt_boxes,
+        gt_angle_unit=ctx.gt_angle_unit,
+        pred_angle_unit=ctx.pred_angle_unit,
     )
 
 
@@ -457,7 +479,8 @@ class _ZeroShotRecallMetric:
 class _PairAccuracyMetric:
     def __init__(self, topk: Sequence[int]):
         self.topk = tuple(topk)
-        self.values = {k: [] for k in self.topk}
+        self.hits = {k: 0 for k in self.topk}
+        self.counts = {k: 0 for k in self.topk}
 
     def add(
         self,
@@ -478,10 +501,14 @@ class _PairAccuracyMetric:
             matched: Set[int] = set()
             for hits in gt_pair_pred_to_gt[:k]:
                 matched.update(int(idx) for idx in hits)
-            self.values[k].append(float(len(matched) / max(int(gt_rel_count), 1)))
+            self.hits[k] += len(matched)
+            self.counts[k] += int(gt_rel_count)
 
     def finalize(self) -> Dict[int, float]:
-        return {k: _safe_mean(v) for k, v in self.values.items()}
+        return {
+            k: float(self.hits[k] / max(self.counts[k], 1))
+            for k in self.topk
+        }
 
 
 def evaluate_sgg(

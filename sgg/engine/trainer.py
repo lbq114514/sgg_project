@@ -16,7 +16,6 @@ from pathlib import Path
 
 from sgg.data.build import build_dataloaders
 from sgg.evaluation import evaluate_sgg
-from sgg.modeling.roi_heads.typed_hyper_rpcm import build_family_predicates
 from sgg.modeling.detectors.class_channel_order import (
     BACKGROUND_LAST,
     INTERNAL_DETECTOR_CLASS_ORDER,
@@ -152,7 +151,17 @@ def _clip_grad_norm(
     return total_norm
 
 
-def _build_eval_debug_lines(metrics: Dict, predicate_names=None, top_predicates: int = 10, top_images: int = 10) -> List[str]:
+def _build_eval_debug_lines(
+    metrics: Dict,
+    predicate_names=None,
+    top_predicates: int = 10,
+    top_images: int = 10,
+    *,
+    print_hardest_images: bool = True,
+    print_candidate_coverage: bool = True,
+    print_pair_confusion: bool = True,
+    print_vehicle_aux: bool = True,
+) -> List[str]:
     lines: List[str] = []
     debug = metrics.get("debug")
     if not isinstance(debug, dict):
@@ -160,7 +169,7 @@ def _build_eval_debug_lines(metrics: Dict, predicate_names=None, top_predicates:
 
     best_k = int(debug.get("best_k", 0))
 
-    images = debug.get("hardest_images", [])
+    images = debug.get("hardest_images", []) if print_hardest_images else []
     if images:
         lines.append(f"Hardest Images @R{best_k}:")
         for item in images[: max(int(top_images), 0)]:
@@ -172,7 +181,10 @@ def _build_eval_debug_lines(metrics: Dict, predicate_names=None, top_predicates:
                 f"pred_pair={int(item.get('pred_pair_count', 0))}, "
                 f"triplet_R={float(item.get('triplet_recall', 0.0)):.3f}"
             )
-    predicate_candidates = debug.get("predicate_candidate_coverage", [])
+    predicate_candidates = (
+        debug.get("predicate_candidate_coverage", [])
+        if print_candidate_coverage else []
+    )
     if predicate_candidates:
         lines.append("Predicate Candidate Coverage:")
         for item in predicate_candidates[: max(int(top_predicates), 0)]:
@@ -187,7 +199,10 @@ def _build_eval_debug_lines(metrics: Dict, predicate_names=None, top_predicates:
                 f"degree={float(item.get('degree_cap', 0.0)):.4f}, "
                 f"final={float(item.get('final', 0.0)):.4f}"
             )
-    predicate_confusion = debug.get("predicate_pair_cls_confusion", [])
+    predicate_confusion = (
+        debug.get("predicate_pair_cls_confusion", [])
+        if print_pair_confusion else []
+    )
     if predicate_confusion:
         lines.append("GT Pair Top-Predicate Confusion:")
         for item in predicate_confusion[: max(int(top_predicates), 0)]:
@@ -205,7 +220,7 @@ def _build_eval_debug_lines(metrics: Dict, predicate_names=None, top_predicates:
                 f"covered={int(item.get('covered', 0))} -> "
                 + ", ".join(pieces)
             )
-    vehicle_aux = debug.get("vehicle_aux", [])
+    vehicle_aux = debug.get("vehicle_aux", []) if print_vehicle_aux else []
     if vehicle_aux:
         lines.append("Vehicle Aux:")
         for item in vehicle_aux[: max(int(top_predicates), 0)]:
@@ -735,6 +750,8 @@ class Trainer:
         self.val_period = int(cfg["SOLVER"].get("VAL_PERIOD", 1))
         self.val_start_period = int(cfg["SOLVER"].get("VAL_START_PERIOD", 0))
         self.print_grad_freq = int(cfg["SOLVER"].get("PRINT_GRAD_FREQ", 50))
+        self.print_train_step_freq = int(cfg["SOLVER"].get("PRINT_TRAIN_STEP_FREQ", 0))
+        self.print_train_batch_freq = int(cfg["SOLVER"].get("PRINT_TRAIN_BATCH_FREQ", 0))
         self.grad_norm_clip = float(cfg["SOLVER"].get("GRAD_NORM_CLIP", 0.0))
         self._scheduler_resolved = False
         self.scheduler = self._build_scheduler()
@@ -990,10 +1007,19 @@ class Trainer:
             "roi_heads.relation.ppg.",
             "roi_heads.relation.ppn.",
         )
+        # Older predcls checkpoints legitimately omit the object-refinement
+        # classifier: predcls returns one-hot GT object labels and never calls
+        # ``out_obj``.  Keep the freshly initialized tensors in that case.
+        # The same compatibility is useful when a predcls checkpoint is used
+        # to initialize sgcls/sgdet, but those tasks must train the retained
+        # random head before the checkpoint is meaningful for evaluation.
         model_init_missing_keys = {
             "roi_heads.relation.predictor.out_obj.weight",
             "roi_heads.relation.predictor.out_obj.bias",
         }
+        optional_model_init_missing = [
+            key for key in incompatible.missing_keys if key in model_init_missing_keys
+        ]
         missing = [
             key for key in incompatible.missing_keys
             if not key.startswith(filter_prefixes) and key not in model_init_missing_keys
@@ -1013,6 +1039,21 @@ class Trainer:
             print(
                 "Checkpoint optional state ignored:",
                 {"missing": ignored_missing, "unexpected": ignored_unexpected},
+                flush=True,
+            )
+        if optional_model_init_missing:
+            task = str(self.cfg.get("MODEL", {}).get("TASK", "")).lower()
+            if task == "predcls":
+                reason = "unused in predcls; GT one-hot object logits are used"
+            else:
+                reason = "randomly initialized; must be trained before sgcls/sgdet evaluation"
+            print(
+                "Checkpoint object-refine state kept from model initialization:",
+                {
+                    "task": task,
+                    "keys": optional_model_init_missing,
+                    "reason": reason,
+                },
                 flush=True,
             )
         resume_state_loaded = True
@@ -1225,141 +1266,25 @@ class Trainer:
         }
 
     def load_rpcm_predictor_weights(self, path: str):
-        """Initialize the compatible TypedHyperRPCM blocks from an RPCM checkpoint."""
+        """Initialize a legacy RPCM relation model from a compatible checkpoint."""
         ckpt = torch.load(path, map_location="cpu")
         source = self._checkpoint_state_dict(ckpt)
-        target = self.model.state_dict()
-        predictor_prefix = "roi_heads.relation.predictor."
         predictor_name = str(
             self.cfg.get("MODEL", {}).get("ROI_RELATION_HEAD", {}).get("PREDICTOR", "")
         )
-        if predictor_name.upper() in {
+        supported_predictors = {
             "RPCM_LEGACY",
             "LEGACY_RPCM",
             "RPCM_ORIGINAL_LEGACY",
             "ORIGINAL_RPCM_LEGACY",
             "RPCM_NATIVE_LEGACY",
-        }:
-            return self._load_legacy_rpcm_model_only(source, path)
-
-        shared_prefixes = (
-            "pairwise_feature_extractor.",
-            "down_samp.",
-            "rel_residual.",
-            "rel_norm.",
-            "proto_head.",
-        )
-        loaded, shape_mismatch, absent = [], [], []
-        update = {}
-        # Everything outside the predictor must migrate strictly. This includes
-        # the detector, ROI/union extractors and relation post-processing state.
-        ignored_external_prefixes = ("roi_heads.relation.ppg.", "roi_heads.relation.ppn.")
-        external_missing = []
-        for key, target_value in target.items():
-            if key.startswith(predictor_prefix) or key.startswith(ignored_external_prefixes):
-                continue
-            if key not in source:
-                external_missing.append(key)
-            elif source[key].shape != target_value.shape:
-                shape_mismatch.append((key, tuple(source[key].shape), tuple(target_value.shape)))
-            else:
-                update[key] = source[key]
-                loaded.append(key)
-        external_unexpected = [
-            key for key in source
-            if not key.startswith(predictor_prefix)
-            and not key.startswith(ignored_external_prefixes)
-            and key not in target
-        ]
-        if external_missing or external_unexpected or any(not key.startswith(predictor_prefix) for key, _, _ in shape_mismatch):
-            raise RuntimeError(
-                "RPCM checkpoint is incompatible outside the predictor: "
-                f"missing={external_missing}, unexpected={external_unexpected}, "
-                f"shape_mismatch={shape_mismatch}"
-            )
-        for key, value in source.items():
-            if not key.startswith(predictor_prefix):
-                continue
-            local_key = key[len(predictor_prefix):]
-            if not local_key.startswith(shared_prefixes):
-                continue
-            if key not in target:
-                absent.append(key)
-            elif target[key].shape != value.shape:
-                shape_mismatch.append((key, tuple(value.shape), tuple(target[key].shape)))
-            else:
-                update[key] = value
-                loaded.append(key)
-        if not any(key.startswith(predictor_prefix) for key in loaded):
-            raise RuntimeError(f"No compatible RPCM predictor weights found in {path}")
-        target.update(update)
-        self.model.load_state_dict(target, strict=True)
-        report = {
-            "checkpoint": path,
-            "loaded": loaded,
-            "shape_mismatch": shape_mismatch,
-            "absent_in_target": absent,
         }
-        print(
-            "RPCM -> TypedHyperRPCM migration:",
-            {"loaded": len(loaded), "shape_mismatch": len(shape_mismatch), "absent": len(absent)},
-            flush=True,
-        )
-        for name in ("shape_mismatch", "absent_in_target"):
-            if report[name]:
-                print(f"  {name}: {report[name]}", flush=True)
-        return report
-
-    def load_typed_stage_weights(self, path: str):
-        """Initialize from a TypedHyperRPCM checkpoint, allowing newly added aux heads."""
-        ckpt = torch.load(path, map_location="cpu")
-        source = self._checkpoint_state_dict(ckpt)
-        target = self.model.state_dict()
-        allowed_missing_prefixes = (
-            "roi_heads.relation.ppg.",
-            "roi_heads.relation.ppn.",
-            "roi_heads.relation.predictor.vehicle_aux_head.",
-            "roi_heads.relation.predictor.vehicle_label_embed.",
-        )
-        allowed_missing_keys = {
-            "roi_heads.relation.predictor.vehicle_logit_scale",
-            "roi_heads.relation.predictor.vehicle_pos_weight",
-        }
-        ignored_unexpected_prefixes = (
-            "roi_heads.relation.ppg.",
-            "roi_heads.relation.ppn.",
-        )
-        update, missing, shape_mismatch = {}, [], []
-        for key, target_value in target.items():
-            if key not in source:
-                if key in allowed_missing_keys or key.startswith(allowed_missing_prefixes):
-                    continue
-                missing.append(key)
-            elif source[key].shape != target_value.shape:
-                shape_mismatch.append((key, tuple(source[key].shape), tuple(target_value.shape)))
-            else:
-                update[key] = source[key]
-        unexpected = [
-            key for key in source
-            if key not in target and not key.startswith(ignored_unexpected_prefixes)
-        ]
-        if missing or shape_mismatch or unexpected:
+        if predictor_name.upper() not in supported_predictors:
             raise RuntimeError(
-                "Typed checkpoint is incompatible: "
-                f"missing={missing}, shape_mismatch={shape_mismatch}, unexpected={unexpected}"
+                "--init-rpcm is only supported by the retained legacy RPCM route; "
+                f"got predictor {predictor_name!r}."
             )
-        target.update(update)
-        self.model.load_state_dict(target, strict=True)
-        print(
-            "TypedHyperRPCM initialization:",
-            {
-                "checkpoint": path,
-                "loaded": len(update),
-                "new_aux_keys": len(target) - len(update),
-            },
-            flush=True,
-        )
-        return {"checkpoint": path, "loaded": list(update.keys())}
+        return self._load_legacy_rpcm_model_only(source, path)
 
     def _move_targets(self, targets):
         return [t.to(self.device) for t in targets]
@@ -1450,8 +1375,6 @@ class Trainer:
         for epoch in range(start_epoch, epochs):
             if max_iterations > 0 and self.global_step >= max_iterations:
                 break
-            # PairGraphBuilder reads this value to apply the GT-injection schedule.
-            self.cfg["_CURRENT_EPOCH"] = epoch + 1
             epoch_start = time.perf_counter()
             self.model.train()
             self._set_frozen_modules_eval()
@@ -1471,12 +1394,39 @@ class Trainer:
                 # ``metas`` is intentionally retained by the data loader so
                 # this does not alter the public batch tuple contract.
                 detector_images, detector_targets = self._sgdet_detector_inputs_from_metas(metas)
+                batch_start_time = time.perf_counter()
+                should_print_batch = (
+                    self.print_train_batch_freq > 0
+                    and batch_idx % self.print_train_batch_freq == 0
+                )
+                if should_print_batch:
+                    raw_sizes = []
+                    if detector_images is not None:
+                        raw_sizes = [
+                            tuple(int(v) for v in image.shape[-2:])
+                            for image in detector_images
+                        ]
+                    print(
+                        f"train batch start epoch {epoch + 1}/{epochs} "
+                        f"batch {batch_idx + 1}/{len(train_loader)} "
+                        f"global_step={self.global_step} "
+                        f"rel_shape={tuple(images.shape)} "
+                        f"raw_hw={raw_sizes}",
+                        flush=True,
+                    )
                 loss_dict = self.model(
                     images,
                     targets,
                     detector_images=detector_images,
                     detector_targets=detector_targets,
                 )
+                if should_print_batch:
+                    print(
+                        f"train batch forward_done epoch {epoch + 1}/{epochs} "
+                        f"batch {batch_idx + 1}/{len(train_loader)} "
+                        f"seconds={time.perf_counter() - batch_start_time:.2f}",
+                        flush=True,
+                    )
                 loss = sum(v for v in loss_dict.values() if torch.is_tensor(v))
                 (loss / accumulation_steps).backward()
                 grad_total_norm = None
@@ -1520,6 +1470,20 @@ class Trainer:
                     (WarmupMultiStepLR, WarmupCosineLR, WarmupLinearDecayLR, WarmupExponentialLR, NoOpLR),
                 ):
                     self.scheduler.step()
+                if (
+                    should_step
+                    and self.print_train_step_freq > 0
+                    and self.global_step % self.print_train_step_freq == 0
+                ):
+                    current_lr = max(float(group["lr"]) for group in self.optimizer.param_groups)
+                    print(
+                        f"train step {self.global_step} "
+                        f"epoch {epoch + 1}/{epochs} "
+                        f"batch {batch_idx + 1}/{len(train_loader)} "
+                        f"loss={loss_values.get('loss_total', 0.0):.4f} "
+                        f"lr={current_lr:.8g}",
+                        flush=True,
+                    )
 
             if epoch_loss_count > 0:
                 avg_losses = {
@@ -1578,13 +1542,28 @@ class Trainer:
                 break
 
     @torch.no_grad()
-    def evaluate_loader(self, loader, return_result: bool = False):
+    def evaluate_loader(
+        self,
+        loader,
+        return_result: bool = False,
+        max_images: int = -1,
+    ):
         self.model.eval()
         preds_all = []
         gts_all = []
         metas_all = []
         graph_debug_enabled = bool(self.cfg.get("TEST", {}).get("GRAPH_DEBUG", {}).get("ENABLED", False))
+        processed_images = 0
         for batch_idx, (images, targets, metas) in enumerate(tqdm(loader, desc="Validation", disable=_disable_tqdm_for_non_tty())):
+            if max_images > 0:
+                remaining = int(max_images) - processed_images
+                if remaining <= 0:
+                    break
+                if len(targets) > remaining:
+                    images = images[:remaining]
+                    targets = targets[:remaining]
+                    metas = metas[:remaining]
+            processed_images += len(targets)
             images = images.to(self.device)
             targets = self._move_targets(targets)
             detector_images, detector_targets = self._sgdet_detector_inputs_from_metas(metas)
@@ -1653,26 +1632,10 @@ class Trainer:
             mean_recall_value = res.mean_recall.get(k, 0.0)
             denom = recall_value + mean_recall_value
             harmonic_recall[k] = 0.0 if denom <= 0 else float(2.0 * recall_value * mean_recall_value / denom)
-        family_predicates = tuple(
-            predicates
-            for family, predicates in sorted(
-                build_family_predicates(self.cfg["MODEL"]["ROI_RELATION_HEAD"]).items()
-            )
-            if family != 0
-        )
-        family_macro_recall = {}
-        for k, per_predicate in res.per_predicate_recall.items():
-            family_values = []
-            for predicates in family_predicates:
-                observed = [float(per_predicate[p]) for p in predicates if res.predicate_counts.get(p, 0) > 0]
-                if observed:
-                    family_values.append(sum(observed) / len(observed))
-            family_macro_recall[k] = sum(family_values) / len(family_values) if family_values else 0.0
         metrics = {
             "R": res.recall,
             "mR": res.mean_recall,
             "HR": harmonic_recall,
-            "family_macro_recall": family_macro_recall,
             "candidate-stage-coverage": res.candidate_stage_coverage,
             "predicate-candidate-stage-coverage": res.predicate_candidate_stage_coverage,
             "vehicle-aux": res.vehicle_aux_stats,
@@ -1688,7 +1651,6 @@ class Trainer:
             predicate_names=predicate_names,
         ):
             print(line, flush=True)
-        print(_format_metric_dict_row("family-mR", family_macro_recall, sorted(family_macro_recall)), flush=True)
         debug_cfg = self.cfg.get("TEST", {}).get("EVAL_DEBUG", {})
         if debug_cfg.get("ENABLED", False):
             best_k = max(int(k) for k in self.cfg["TEST"]["RECALL_AT"])
@@ -1793,6 +1755,10 @@ class Trainer:
                 predicate_names=predicate_names,
                 top_predicates=int(debug_cfg.get("TOP_PREDICATES", 10)),
                 top_images=int(debug_cfg.get("TOP_IMAGES", 10)),
+                print_hardest_images=bool(debug_cfg.get("PRINT_HARDEST_IMAGES", False)),
+                print_candidate_coverage=bool(debug_cfg.get("PRINT_CANDIDATE_COVERAGE", False)),
+                print_pair_confusion=bool(debug_cfg.get("PRINT_PAIR_CONFUSION", False)),
+                print_vehicle_aux=bool(debug_cfg.get("PRINT_VEHICLE_AUX", False)),
             ):
                 print(line, flush=True)
         if return_result:

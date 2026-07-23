@@ -1,8 +1,7 @@
-torch
-torchvision
-numpy
-opencv-python
-Pillow
-h5py
-tqdm
-mmcv
+# CUDA-sensitive packages. For a reliable installation use:
+#   bash scripts/create_clean_env.sh
+torch==2.2.2
+torchvision==0.17.2
+mmcv-full==1.7.2
+
+-r requirements.clean.txt

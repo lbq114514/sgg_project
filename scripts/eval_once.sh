@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-pyg}"
+CONDA_ENV="${CONDA_ENV:-sgg}"
 SPLIT="${SPLIT:-test}"
 DEVICE="${DEVICE:-cuda}"
 FILTER_METHOD="${FILTER_METHOD:-}"
@@ -30,6 +30,7 @@ Common options:
   FILTER_METHOD=PPG|PPN|RSGP             optional runtime override;
                                         if omitted, the config decides.
   PAIR_FILTER_CHECKPOINT=...             optional PPG/PPN checkpoint override.
+  MAX_IMAGES=N                           optional deterministic prefix limit.
   LOG_FILE=...                           default: ${OUTPUT_DIR}/test.log
   OUTPUT_JSON=...                        default: ${OUTPUT_DIR}/test_metrics.json
 
@@ -77,6 +78,9 @@ if [[ -n "${FILTER_METHOD}" ]]; then
 fi
 if [[ -n "${PAIR_FILTER_CHECKPOINT}" ]]; then
   cmd+=(--pair-filter-checkpoint "${PAIR_FILTER_CHECKPOINT}")
+fi
+if [[ -n "${MAX_IMAGES:-}" ]]; then
+  cmd+=(--max-images "${MAX_IMAGES}")
 fi
 
 nohup "${cmd[@]}" > "${LOG_FILE}" 2>&1 &

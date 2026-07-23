@@ -1,0 +1,17 @@
+# Pure-Python/runtime dependencies for the tested STAR SGG stack.
+#
+# PyTorch/torchvision and mmcv-full are installed separately by
+# scripts/create_clean_env.sh because their builds must match CUDA exactly.
+numpy==1.26.4
+opencv-python==4.11.0.86
+Pillow==11.0.0
+h5py==3.14.0
+tqdm==4.65.2
+
+# Runtime dependencies of mmcv-full 1.7.x. Pinning these keeps a source-built
+# MMCV environment reproducible.
+addict==2.4.0
+packaging==24.2
+PyYAML==6.0.2
+yapf==0.43.0
+

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import string
 from typing import Dict, List, Sequence
 from pathlib import Path
 
@@ -67,6 +68,19 @@ _DEFAULT_REL_COMPETITOR_NAME_PAIRS = [
     ("randomly parked on", "parallelly parked on"),
     ("incorrectly parked on", "parallelly parked on"),
     ("docked alongside with", "docking at the same dock with"),
+]
+
+# Exact predicate-id pairs used by the RPCM run that produced
+# ``weights/6850_4135.pth``.  These pairs intentionally preserve the historic
+# implementation, including duplicated/approximate semantic pairings.  They
+# are plain Python data rather than buffers, so enabling the compatibility
+# path does not change the checkpoint state_dict.
+_RPCM_6850_ANTONYM_ID_PAIRS = [
+    (9, 24), (1, 2), (8, 10), (39, 35), (21, 22), (33, 34), (5, 27),
+    (12, 13), (23, 24), (28, 25), (15, 20), (41, 25), (11, 36),
+    (38, 37), (40, 36), (6, 31), (50, 51), (52, 53), (55, 58),
+    (45, 48), (29, 30), (47, 49), (54, 17), (18, 19), (56, 57),
+    (42, 44),
 ]
 
 _PROTO_INIT_STOPWORDS = {"in", "the", "with", "of", "at", "on", "to", "from"}
@@ -850,26 +864,51 @@ class _OriginalRPCMPairwiseFeatureExtractor(nn.Module):
         self.pooling_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "CONTEXT_POOLING_DIM", default=in_channels))
         self.rel_feature_type = str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "EDGE_FEATURES_REPRESENTATION", default="fusion"))
         self.word_embed_feats_on = bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "WORD_EMBEDDING_FEATURES", default=True))
+        self.glove_init_mode = str(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_GLOVE_INIT_MODE", default="current")
+        ).lower()
+        self.exact_6850 = bool(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_6850_EXACT", default=False)
+        )
 
         if self.word_embed_feats_on:
-            obj_embed_vecs, obj_embed_mask, _ = _build_semantic_prototypes(
-                self.obj_classes,
-                self.embed_dim,
-                str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")),
-                self.embed_dim,
-                "semantic",
-                modifier_aware=bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PROTO_TEXT_INIT_MODIFIER_AWARE", default=True)),
+            semantic_glove_path = str(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")
             )
-            self.obj_embed_on_prob_dist = nn.Embedding(self.num_obj_classes, self.embed_dim)
-            self.obj_embed_on_pred_label = nn.Embedding(self.num_obj_classes, self.embed_dim)
-            with torch.no_grad():
-                self.obj_embed_on_prob_dist.weight.normal_(0, 1)
-                self.obj_embed_on_pred_label.weight.normal_(0, 1)
-                if obj_embed_mask.any():
-                    self.obj_embed_on_prob_dist.weight[obj_embed_mask[: self.num_obj_classes]] = obj_embed_vecs[: self.num_obj_classes][obj_embed_mask[: self.num_obj_classes]]
-                    self.obj_embed_on_pred_label.weight[obj_embed_mask[: self.num_obj_classes]] = obj_embed_vecs[: self.num_obj_classes][obj_embed_mask[: self.num_obj_classes]]
+            if self.glove_init_mode == "rpcm":
+                obj_embed_vecs, self.obj_glove_diagnostics = _build_rpcm_object_glove_init(
+                    self.obj_classes[: self.num_obj_classes],
+                    semantic_glove_path,
+                    self.embed_dim,
+                )
+                # Preserve RPCM RNG order: build obj_edge_vectors first, then
+                # construct both nn.Embedding modules, then copy all rows.
+                self.obj_embed_on_prob_dist = nn.Embedding(self.num_obj_classes, self.embed_dim)
+                self.obj_embed_on_pred_label = nn.Embedding(self.num_obj_classes, self.embed_dim)
+                with torch.no_grad():
+                    self.obj_embed_on_prob_dist.weight.copy_(obj_embed_vecs)
+                    self.obj_embed_on_pred_label.weight.copy_(obj_embed_vecs)
+            else:
+                obj_embed_vecs, obj_embed_mask, self.obj_glove_diagnostics = _build_semantic_prototypes(
+                    self.obj_classes,
+                    self.embed_dim,
+                    semantic_glove_path,
+                    self.embed_dim,
+                    "semantic",
+                    modifier_aware=bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PROTO_TEXT_INIT_MODIFIER_AWARE", default=True)),
+                )
+                self.obj_embed_on_prob_dist = nn.Embedding(self.num_obj_classes, self.embed_dim)
+                self.obj_embed_on_pred_label = nn.Embedding(self.num_obj_classes, self.embed_dim)
+                with torch.no_grad():
+                    self.obj_embed_on_prob_dist.weight.normal_(0, 1)
+                    self.obj_embed_on_pred_label.weight.normal_(0, 1)
+                    if obj_embed_mask.any():
+                        valid = obj_embed_mask[: self.num_obj_classes]
+                        self.obj_embed_on_prob_dist.weight[valid] = obj_embed_vecs[: self.num_obj_classes][valid]
+                        self.obj_embed_on_pred_label.weight[valid] = obj_embed_vecs[: self.num_obj_classes][valid]
         else:
             self.embed_dim = 0
+            self.obj_glove_diagnostics = {}
 
         self.rel_feat_dim_not_match = self.pooling_dim != in_channels
         if self.rel_feat_dim_not_match:
@@ -1436,6 +1475,240 @@ def _load_glove_vectors(glove_path: str, embed_dim: int) -> dict[str, torch.Tens
     return vectors
 
 
+_RPCM_GLOVE_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "to", "with", "in", "on", "at", "for", "by", "from",
+    "is", "are", "was", "were", "be", "being", "been", "as", "that", "this", "these", "those",
+    "into", "within", "over", "under", "between", "among", "through", "along", "across",
+    "same", "different", "opposite",
+}
+_RPCM_NEGATION_PAIRS = (
+    ("parked alongside with", "not parked alongside with"),
+    ("working on", "not working on"),
+    ("co-storage with", "not co-storage with"),
+    ("run along", "not run along"),
+    ("docked alongside with", "not docked alongside with"),
+)
+_RPCM_SAME_DIFFERENT_PAIRS = (
+    ("parking in the same apron with", "parking in the different apron with"),
+    ("docking at the same dock with", "docking at the different dock with"),
+    ("within same line of", "within different line of"),
+    ("driving in the same lane with", "driving in the different lane with"),
+    ("running along the same taxiway with", "running along the different taxiway with"),
+    ("in the same parking with", "in the different parking with"),
+)
+_RPCM_SAME_OPPOSITE_PAIRS = (
+    ("driving in the same direction with", "driving in the opposite direction with"),
+)
+
+
+def _load_rpcm_glove_table(
+    glove_path: str,
+    embed_dim: int,
+) -> tuple[dict[str, int], torch.Tensor] | None:
+    """Load the exact ``(word_to_idx, vectors, dim)`` table used by RPCM.
+
+    RPCM prefers ``glove.6B.<dim>d.pt`` even when the caller conceptually
+    specifies the text file/directory.  Using that table here avoids a second
+    parser and makes scratch initialization numerically reproducible.
+    """
+
+    path = Path(glove_path)
+    candidates: list[Path] = []
+    if path.suffix == ".pt":
+        candidates.append(path)
+    elif path.suffix == ".txt":
+        candidates.extend((path.with_suffix(".pt"), path))
+    elif path.is_dir():
+        candidates.extend(
+            (
+                path / f"glove.6B.{embed_dim}d.pt",
+                path / f"glove.6B.{embed_dim}d.txt",
+            )
+        )
+    else:
+        candidates.extend((path.with_suffix(".pt"), path.with_suffix(".txt"), path))
+
+    for candidate in candidates:
+        if not candidate.is_file() or candidate.suffix != ".pt":
+            continue
+        loaded = torch.load(candidate, map_location="cpu")
+        if isinstance(loaded, (tuple, list)) and len(loaded) >= 2:
+            word_to_idx, vectors = loaded[0], loaded[1]
+            if isinstance(word_to_idx, dict) and torch.is_tensor(vectors):
+                if vectors.ndim == 2 and vectors.size(1) == embed_dim:
+                    return word_to_idx, vectors.float()
+
+    vectors_by_word = _load_glove_vectors(str(path), embed_dim)
+    if not vectors_by_word:
+        return None
+    words = list(vectors_by_word)
+    return {word: idx for idx, word in enumerate(words)}, torch.stack(
+        [vectors_by_word[word] for word in words], dim=0
+    ).float()
+
+
+def _rpcm_token_alias(token: str) -> str:
+    if token == "parallelly":
+        return "parallel"
+    if token == "isolatedly":
+        return "isolated"
+    if token == "co-storage":
+        return "storage"
+    return token
+
+
+def _build_rpcm_object_glove_init(
+    names: Sequence[str],
+    glove_path: str,
+    embed_dim: int,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Reproduce RPCM ``obj_edge_vectors`` without dataset binding.
+
+    Foreground rows retain the raw GloVe scale.  Row zero is deliberately the
+    random ``N(0, 1)`` background initialized by the original implementation.
+    """
+
+    table = _load_rpcm_glove_table(glove_path, embed_dim)
+    vectors = torch.empty((len(names), embed_dim), dtype=torch.float32)
+    vectors.normal_(0.0, 1.0)
+    if table is None:
+        return vectors, {"missing_classes": list(map(str, names[1:])), "missing_tokens": []}
+    word_to_idx, glove_vectors = table
+    missing_classes: list[str] = []
+    missing_tokens: list[str] = []
+    for idx, raw_name in enumerate(names):
+        if idx == 0:
+            continue
+        name = str(raw_name)
+        word_idx = word_to_idx.get(name)
+        if word_idx is not None:
+            vectors[idx] = glove_vectors[word_idx]
+            continue
+        pieces = name.split("_")
+        piece_vectors = []
+        for piece in pieces:
+            piece_idx = word_to_idx.get(piece)
+            if piece_idx is None:
+                missing_tokens.append(f"{name}:{piece}")
+            else:
+                piece_vectors.append(glove_vectors[piece_idx])
+        if piece_vectors:
+            vectors[idx] = torch.stack(piece_vectors, dim=0).mean(dim=0)
+        else:
+            missing_classes.append(name)
+    return vectors, {
+        "missing_classes": missing_classes,
+        "missing_tokens": sorted(set(missing_tokens)),
+    }
+
+
+def _rpcm_clean_relation_tokens(text: str) -> list[str]:
+    text = text.lower().replace("co-storage", "co_storage")
+    text = text.translate(str.maketrans("", "", string.punctuation.replace("-", "")))
+    text = text.replace("co_storage", "co-storage")
+    return [_rpcm_token_alias(token) for token in text.split() if token]
+
+
+def _build_rpcm_relation_glove_init(
+    names: Sequence[str],
+    glove_path: str,
+    embed_dim: int,
+    *,
+    lambda_not: float = 1.0,
+    kappa_same_diff: float = 1.0,
+    kappa_same_opp: float = 1.0,
+    pair_boost: float = 1.2,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Exact dataset-independent port of RPCM predicate GloVe prototypes."""
+
+    table = _load_rpcm_glove_table(glove_path, embed_dim)
+    vectors = torch.randn((len(names), embed_dim), dtype=torch.float32)
+    # The source first allocates all rows with torch.randn and then explicitly
+    # re-samples the background row inside its class loop.
+    if len(names) > 0:
+        vectors[0].normal_(0.0, 1.0)
+    if table is None:
+        return F.normalize(vectors, dim=1), {"missing_predicates": list(map(str, names[1:]))}
+    word_to_idx, glove_vectors = table
+
+    def normalized(value: torch.Tensor) -> torch.Tensor:
+        return F.normalize(value, dim=0)
+
+    def token_vector(token: str) -> torch.Tensor | None:
+        word_idx = word_to_idx.get(token)
+        return normalized(glove_vectors[word_idx]) if word_idx is not None else None
+
+    def base_vector(tokens: Sequence[str]) -> torch.Tensor:
+        polar_tokens = {"not", "same", "different", "opposite"}
+        base_tokens = [
+            token for token in tokens
+            if (token not in _RPCM_GLOVE_STOPWORDS or token in polar_tokens)
+        ]
+        base_tokens = [token for token in base_tokens if token not in polar_tokens]
+        if not base_tokens:
+            base_tokens = [token for token in tokens if token != "not"]
+        token_vectors = [token_vector(token) for token in base_tokens]
+        token_vectors = [value for value in token_vectors if value is not None]
+        if not token_vectors:
+            return normalized(torch.randn((embed_dim,), dtype=torch.float32))
+        # RPCM's SIF helper uses freq=1 for every token. Preserve its literal
+        # multiply/sum/divide sequence instead of simplifying to mean so the
+        # floating-point initialization also agrees.
+        stacked = torch.stack(token_vectors, dim=0)
+        weight = 1e-3 / (1e-3 + 1.0)
+        weights = torch.full((stacked.size(0), 1), weight, dtype=torch.float32)
+        return normalized((stacked * weights).sum(dim=0) / (weights.sum() + 1e-9))
+
+    def apply_polar_axis(
+        value: torch.Tensor,
+        positive: str,
+        negative: str,
+        tokens: Sequence[str],
+        strength: float,
+    ) -> torch.Tensor:
+        positive_vec, negative_vec = token_vector(positive), token_vector(negative)
+        if positive_vec is None or negative_vec is None:
+            return value
+        axis = normalized(negative_vec - positive_vec)
+        if (positive in tokens) ^ (negative in tokens):
+            sign = 1.0 if negative in tokens else -1.0
+            return normalized(value + sign * strength * axis)
+        return value
+
+    normalized_names = [str(name).strip().lower() for name in names]
+    raw_vectors: dict[int, torch.Tensor] = {}
+    for idx, name in enumerate(normalized_names):
+        if idx == 0:
+            continue
+        tokens = _rpcm_clean_relation_tokens(name)
+        value = base_vector(tokens)
+        if "not" in tokens:
+            not_vector = token_vector("not")
+            if not_vector is not None:
+                value = normalized(value - float(lambda_not) * not_vector)
+        value = apply_polar_axis(value, "same", "different", tokens, float(kappa_same_diff))
+        value = apply_polar_axis(value, "same", "opposite", tokens, float(kappa_same_opp))
+        raw_vectors[idx] = normalized(value)
+
+    name_to_idx = {name: idx for idx, name in enumerate(normalized_names)}
+    for pair_group in (_RPCM_NEGATION_PAIRS, _RPCM_SAME_DIFFERENT_PAIRS, _RPCM_SAME_OPPOSITE_PAIRS):
+        for positive_name, negative_name in pair_group:
+            positive_idx = name_to_idx.get(positive_name)
+            negative_idx = name_to_idx.get(negative_name)
+            if positive_idx is None or negative_idx is None:
+                continue
+            positive_vec = raw_vectors[positive_idx]
+            negative_vec = raw_vectors[negative_idx]
+            axis = normalized(negative_vec - positive_vec)
+            boost = float(pair_boost) - 1.0
+            raw_vectors[positive_idx] = normalized(positive_vec - boost * axis)
+            raw_vectors[negative_idx] = normalized(negative_vec + boost * axis)
+
+    for idx, value in raw_vectors.items():
+        vectors[idx] = value
+    return F.normalize(vectors, dim=1), {"missing_predicates": []}
+
+
 def _project_text_vector(text_vec: torch.Tensor, feat_dim: int) -> torch.Tensor:
     if text_vec.numel() == feat_dim:
         return text_vec
@@ -1888,6 +2161,59 @@ class _LegacyGraphConvolutionLayerCollect(nn.Module):
         return self.collect_units[int(unit_id)](target, source, attention)
 
 
+class _SGGToolkitGraphConvolutionLayerCollect(nn.Module):
+    """Six-way heterogeneous message collector used by SGG-ToolKit RPCM.
+
+    The original implementation owns one collector and reuses it at every
+    feature-update step.  The unit ordering is part of the implementation:
+
+    0/1: relation -> subject/object entity
+    2/3: subject/object entity -> relation
+    4:   entity -> entity
+    5:   relation -> relation
+    """
+
+    def __init__(self, dim_obj: int, dim_rel: int):
+        super().__init__()
+        self.collect_units = nn.ModuleList(
+            [
+                _LegacyCollectionUnit(dim_rel, dim_obj),
+                _LegacyCollectionUnit(dim_rel, dim_obj),
+                _LegacyCollectionUnit(dim_obj, dim_rel),
+                _LegacyCollectionUnit(dim_obj, dim_rel),
+                _LegacyCollectionUnit(dim_obj, dim_obj),
+                _LegacyCollectionUnit(dim_rel, dim_rel),
+            ]
+        )
+
+    def forward(
+        self,
+        target: torch.Tensor,
+        source: torch.Tensor,
+        attention: torch.Tensor,
+        unit_id: int,
+    ) -> torch.Tensor:
+        return self.collect_units[int(unit_id)](target, source, attention)
+
+
+class _SGGToolkitGraphConvolutionLayerUpdate(nn.Module):
+    """Parameter-free residual update from the original SGG-ToolKit AGCN."""
+
+    @staticmethod
+    def forward(
+        target: torch.Tensor,
+        source: torch.Tensor,
+        unit_id: int,
+    ) -> torch.Tensor:
+        del unit_id
+        if target.size() != source.size():
+            raise ValueError(
+                "SGG-ToolKit GCN update requires matching target/source "
+                f"shapes, got {tuple(target.shape)} and {tuple(source.shape)}"
+            )
+        return target + source
+
+
 class _LegacyCABias(nn.Module):
     """Original RPCM context-adaptive bias module."""
 
@@ -2045,14 +2371,14 @@ class _LegacyCABias(nn.Module):
 
 
 class LegacyPredicatePrototypeHead(nn.Module):
-    """Original RPCM-style predicate prototype head.
+    """RPCM predicate prototype head with exact 6850 compatibility.
 
     Later RPCM checkpoints in this workspace use a K-prototype tensor
     ``[num_rel, K, glove_dim]`` plus optional visual EMA buffers.  The older
     ``6850_4135.pth`` checkpoint used a single 2D prototype tensor
-    ``[num_rel, glove_dim]`` and did not register visual-prototype buffers.  The
-    ``checkpoint_compat_2d`` flag keeps that older state_dict layout exactly so
-    the legacy predictor can share parameters strictly with both variants.
+    ``[num_rel, glove_dim]`` and a static ``proto_ema`` initialization anchor,
+    but no batch-updated ``proto_vis`` buffers.  ``exact_6850`` restores its
+    initialization and losses without changing that checkpoint layout.
     """
 
     def __init__(
@@ -2075,12 +2401,17 @@ class LegacyPredicatePrototypeHead(nn.Module):
         vis_momentum: float = 0.9,
         alpha_fuse: float = 0.7,
         checkpoint_compat_2d: bool = False,
+        exact_6850: bool = False,
+        ant_pairs: Sequence[tuple[int, int]] | None = None,
+        lambda_ant: float = 0.1,
+        ant_margin: float = -0.2,
     ):
         super().__init__()
         self.d = int(d)
         self.tau = nn.Parameter(torch.tensor(float(tau)), requires_grad=True)
         self.num_proto_per_cls = int(num_proto_per_cls)
         self.checkpoint_compat_2d = bool(checkpoint_compat_2d)
+        self.exact_6850 = bool(exact_6850)
         if self.checkpoint_compat_2d and self.num_proto_per_cls != 1:
             raise ValueError("2D legacy prototype compatibility requires num_proto_per_cls == 1")
         self.proto_agg = str(proto_agg)
@@ -2088,6 +2419,10 @@ class LegacyPredicatePrototypeHead(nn.Module):
         self.use_vis_proto = bool(use_vis_proto)
         if self.checkpoint_compat_2d and self.use_vis_proto:
             raise ValueError("2D legacy prototype compatibility does not register visual prototype buffers")
+        if self.exact_6850 and not self.checkpoint_compat_2d:
+            raise ValueError("Exact RPCM-6850 behavior requires 2D prototype compatibility")
+        if self.exact_6850 and self.use_vis_proto:
+            raise ValueError("Exact RPCM-6850 behavior does not use visual prototype buffers")
         self.vis_momentum = float(vis_momentum)
         self.alpha_fuse = float(alpha_fuse)
         self.ema_alpha = ema_alpha
@@ -2095,6 +2430,9 @@ class LegacyPredicatePrototypeHead(nn.Module):
         self.lambda_sep = float(lambda_sep)
         self.sep_type = str(sep_type)
         self.gamma = float(gamma)
+        self.ant_pairs = [(int(left), int(right)) for left, right in (ant_pairs or [])]
+        self.lambda_ant = float(lambda_ant)
+        self.ant_margin = float(ant_margin)
 
         if use_proj:
             layers: list[nn.Module] = [nn.Linear(d_in, d, bias=False)]
@@ -2109,10 +2447,16 @@ class LegacyPredicatePrototypeHead(nn.Module):
 
         num_classes, glove_dim = glove_init.shape
         if self.checkpoint_compat_2d:
-            base = glove_init.contiguous()
+            # The historical ProtoHead used ``glove_init.clone()``.  Keep a
+            # distinct storage here as well so later in-place changes to the
+            # source matrix cannot alter the learnable checkpoint parameter.
+            base = glove_init.clone() if self.exact_6850 else glove_init.contiguous()
         else:
             base = glove_init.unsqueeze(1).repeat(1, self.num_proto_per_cls, 1).contiguous()
-        base = base + 0.01 * torch.randn_like(base)
+        # The 6850 run copied its GloVe matrix exactly.  The perturbation is
+        # retained only for later experimental multi-prototype variants.
+        if not self.exact_6850:
+            base = base + 0.01 * torch.randn_like(base)
         self.base_prototypes = nn.Parameter(base)
         self.mapper = nn.Linear(glove_dim, d, bias=False)
         nn.init.orthogonal_(self.mapper.weight)
@@ -2211,7 +2555,11 @@ class LegacyPredicatePrototypeHead(nn.Module):
         if not self.training:
             return logits, losses
 
-        self.update_glove_ema()
+        # Despite the historic name, 6850 never called update_ema() from its
+        # forward path.  ``proto_ema`` therefore remains the initialization
+        # anchor stored in the checkpoint instead of tracking training batches.
+        if not self.exact_6850:
+            self.update_glove_ema()
         if labels is not None and labels.numel() > 0:
             valid = (labels >= 0) & (labels < proto.size(0))
             if valid.any():
@@ -2239,6 +2587,22 @@ class LegacyPredicatePrototypeHead(nn.Module):
             mask = ~torch.eye(proto_mean.size(0), dtype=torch.bool, device=proto_mean.device)
             loss_sep = torch.exp(self.gamma * gram[mask]).mean() if mask.any() else proto_mean.sum() * 0.0
         losses["sep"] = self.lambda_sep * loss_sep
+        if self.ant_pairs and self.lambda_ant > 0.0:
+            ant_terms = []
+            for left, right in self.ant_pairs:
+                if left < 0 or right < 0 or left >= proto_mean.size(0) or right >= proto_mean.size(0):
+                    continue
+                cosine = (proto_mean[left] * proto_mean[right]).sum()
+                # Preserve the exact historic expression.  Although its sign
+                # is unusual for a separation margin, changing it would no
+                # longer reproduce the checkpoint's training objective.
+                ant_terms.append(F.relu(self.ant_margin - cosine))
+            loss_ant = (
+                torch.stack(ant_terms).mean()
+                if ant_terms
+                else proto_mean.sum() * 0.0
+            )
+            losses["ant"] = self.lambda_ant * loss_ant
         return logits, losses
 
 
@@ -2247,7 +2611,9 @@ class RPCMLegacy(nn.Module):
 
     It keeps the current project's BoxList/feature-extractor interfaces, but
     restores the original dense object-relation graph propagation and
-    multi-prototype relation classifier.
+    semantic prototype classifier.  ``RPCM_LEGACY_6850_EXACT`` selects the
+    single-prototype dual-view version used by ``6850_4135.pth``; later
+    multi-prototype experiments remain available behind their own settings.
     """
 
     def __init__(self, cfg: dict, in_channels: int):
@@ -2260,6 +2626,55 @@ class RPCMLegacy(nn.Module):
         self.mlp_dim = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_MLP_DIM", default=2048))
         self.graph_dim = self.pooling_dim
         self.feat_update_step = int(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_FEAT_UPDATE_STEP", default=2))
+        self.relation_graph_mode = str(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_RELATION_GRAPH_MODE",
+                default="dual_view",
+            )
+        ).lower()
+        self.exact_6850 = bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_LEGACY_6850_EXACT",
+                default=False,
+            )
+        )
+        if self.relation_graph_mode not in {"sgg_toolkit", "unified", "dual_view"}:
+            raise ValueError(
+                "MODEL.ROI_RELATION_HEAD.RPCM_RELATION_GRAPH_MODE must be "
+                "'sgg_toolkit', 'unified' or 'dual_view', "
+                f"got {self.relation_graph_mode!r}"
+            )
+        self.rel_subj_view_enabled = bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_REL_SUBJ_VIEW_ENABLED",
+                default=True,
+            )
+        )
+        self.rel_obj_view_enabled = bool(
+            _cfg_get(
+                cfg,
+                "MODEL",
+                "ROI_RELATION_HEAD",
+                "RPCM_REL_OBJ_VIEW_ENABLED",
+                default=True,
+            )
+        )
+        if self.relation_graph_mode == "dual_view" and not (
+            self.rel_subj_view_enabled or self.rel_obj_view_enabled
+        ):
+            raise ValueError(
+                "dual_view RPCM requires at least one of "
+                "RPCM_REL_SUBJ_VIEW_ENABLED/RPCM_REL_OBJ_VIEW_ENABLED"
+            )
         dropout = float(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_DROPOUT", default=0.2))
         self.predict_use_bias = bool(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICT_USE_BIAS", default=False))
         self.bias_lambda_train = float(
@@ -2290,7 +2705,20 @@ class RPCMLegacy(nn.Module):
         )
 
         self.post_emb = nn.Linear(in_channels, self.mlp_dim * 2)
-        self.pairwise_feature_extractor = PairwiseFeatureExtractor(cfg, in_channels)
+        predictor_name = str(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICTOR", default="")
+        ).upper()
+        self.uses_original_pairwise_extractor = predictor_name in {
+            "RPCM_ORIGINAL_LEGACY",
+            "ORIGINAL_RPCM_LEGACY",
+            "RPCM_NATIVE_LEGACY",
+        }
+        pairwise_cls = (
+            _OriginalRPCMPairwiseFeatureExtractor
+            if self.uses_original_pairwise_extractor
+            else PairwiseFeatureExtractor
+        )
+        self.pairwise_feature_extractor = pairwise_cls(cfg, in_channels)
         self.rel_residual = nn.Sequential(
             nn.Linear(self.mlp_dim, self.mlp_dim),
             nn.ReLU(inplace=True),
@@ -2299,13 +2727,22 @@ class RPCMLegacy(nn.Module):
         self.rel_norm = nn.LayerNorm(self.mlp_dim)
         self.down_samp = MLP(self.pooling_dim, self.mlp_dim, self.mlp_dim, 2)
 
-        self.gcn_ent2ent = nn.ModuleList()
-        self.gcn_ent2rel = nn.ModuleList()
-        self.gcn_rel2rel = nn.ModuleList()
-        for _ in range(self.feat_update_step):
-            self.gcn_ent2ent.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
-            self.gcn_ent2rel.append(_LegacyGraphConvolutionLayerCollect(self.graph_dim, self.graph_dim))
-            self.gcn_rel2rel.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
+        if self.relation_graph_mode == "sgg_toolkit":
+            # SGG-ToolKit creates one six-way collector and one parameter-free
+            # updater, then shares them across all feature-update iterations.
+            self.gcn_collect_feat = _SGGToolkitGraphConvolutionLayerCollect(
+                self.graph_dim,
+                self.graph_dim,
+            )
+            self.gcn_update_feat = _SGGToolkitGraphConvolutionLayerUpdate()
+        else:
+            self.gcn_ent2ent = nn.ModuleList()
+            self.gcn_ent2rel = nn.ModuleList()
+            self.gcn_rel2rel = nn.ModuleList()
+            for _ in range(self.feat_update_step):
+                self.gcn_ent2ent.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
+                self.gcn_ent2rel.append(_LegacyGraphConvolutionLayerCollect(self.graph_dim, self.graph_dim))
+                self.gcn_rel2rel.append(_LegacyGCNLayer(self.graph_dim, self.graph_dim, residual=True))
 
         if self.tail_aux_enabled:
             tail_aux_hidden_dim = int(
@@ -2370,6 +2807,9 @@ class RPCMLegacy(nn.Module):
             )
             or _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "SEMANTIC_GLOVE_PATH", default="")
         )
+        self.glove_init_mode = str(
+            _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_GLOVE_INIT_MODE", default="current")
+        ).lower()
         self.pos_embed = nn.Sequential(
             nn.Linear(9, 32),
             nn.BatchNorm1d(32, momentum=0.001),
@@ -2382,18 +2822,24 @@ class RPCMLegacy(nn.Module):
             obj_class_names += [
                 f"class_{idx}" for idx in range(len(obj_class_names), self.num_obj_classes)
             ]
-        obj_embed_vecs, obj_embed_mask, obj_text_diag = _build_semantic_prototypes(
-            obj_class_names[: self.num_obj_classes],
-            proto_embed_dim,
-            semantic_glove_path,
-            proto_embed_dim,
-            str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_PROTO_INIT", default="semantic")),
-            modifier_aware=False,
-        )
-        with torch.no_grad():
-            valid = obj_embed_mask[: self.num_obj_classes]
-            if valid.any():
-                self.obj_embed1.weight[valid] = obj_embed_vecs[: self.num_obj_classes][valid]
+        if self.glove_init_mode == "rpcm":
+            # RPCM creates this auxiliary refinement embedding with the native
+            # nn.Embedding N(0,1) initializer.  Object GloVe is used by the two
+            # embeddings inside PairwiseFeatureExtractor, not by obj_embed1.
+            obj_text_diag = {"missing_classes": [], "missing_tokens": []}
+        else:
+            obj_embed_vecs, obj_embed_mask, obj_text_diag = _build_semantic_prototypes(
+                obj_class_names[: self.num_obj_classes],
+                proto_embed_dim,
+                semantic_glove_path,
+                proto_embed_dim,
+                str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_PROTO_INIT", default="semantic")),
+                modifier_aware=False,
+            )
+            with torch.no_grad():
+                valid = obj_embed_mask[: self.num_obj_classes]
+                if valid.any():
+                    self.obj_embed1.weight[valid] = obj_embed_vecs[: self.num_obj_classes][valid]
         self.lin_obj_cyx = nn.Linear(in_channels + proto_embed_dim + 128, 512)
         self.out_obj = nn.Linear(512, self.num_obj_classes)
         if bool(
@@ -2419,15 +2865,22 @@ class RPCMLegacy(nn.Module):
             self.relation_names = self.relation_names + [
                 f"relation_{idx}" for idx in range(len(self.relation_names), self.num_rel_classes)
             ]
-        rel_glove_init, rel_text_diag = _build_prototype_text_init(
-            self.relation_names,
-            semantic_glove_path,
-            proto_embed_dim,
-            str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_PROTO_INIT", default="semantic")),
-            modifier_aware=bool(
-                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PROTO_TEXT_INIT_MODIFIER_AWARE", default=True)
-            ),
-        )
+        if self.glove_init_mode == "rpcm":
+            rel_glove_init, rel_text_diag = _build_rpcm_relation_glove_init(
+                self.relation_names,
+                semantic_glove_path,
+                proto_embed_dim,
+            )
+        else:
+            rel_glove_init, rel_text_diag = _build_prototype_text_init(
+                self.relation_names,
+                semantic_glove_path,
+                proto_embed_dim,
+                str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_PROTO_INIT", default="semantic")),
+                modifier_aware=bool(
+                    _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PROTO_TEXT_INIT_MODIFIER_AWARE", default=True)
+                ),
+            )
         self.rel_proto = LegacyPredicatePrototypeHead(
             d_in=self.mlp_dim,
             d=self.mlp_dim,
@@ -2448,25 +2901,66 @@ class RPCMLegacy(nn.Module):
                     default=False,
                 )
             ),
+            exact_6850=self.exact_6850,
+            ant_pairs=_RPCM_6850_ANTONYM_ID_PAIRS if self.exact_6850 else (),
+            lambda_ant=float(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_ANT_LOSS_WEIGHT", default=0.1)
+            ),
+            ant_margin=float(
+                _cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "RPCM_LEGACY_ANT_MARGIN", default=-0.2)
+            ),
         )
         print(
             "[RPCM_LEGACY] "
             f"graph_dim={self.graph_dim}, mlp_dim={self.mlp_dim}, feat_update_step={self.feat_update_step}, "
+            f"relation_graph={self.relation_graph_mode}, "
+            f"exact_6850={self.exact_6850}, "
+            f"glove_init={self.glove_init_mode}, "
             f"glove_missing={rel_text_diag.get('missing_predicates', [])}, "
-            f"obj_glove_missing={obj_text_diag.get('missing_predicates', [])}",
+            f"obj_glove_missing={obj_text_diag.get('missing_predicates', obj_text_diag.get('missing_classes', []))}",
             flush=True,
         )
 
     def _get_map_idxs(self, proposals: Sequence, proposal_pairs: Sequence[torch.Tensor]):
         obj_num = sum(len(p) for p in proposals)
+        device = proposals[0].bbox.device if proposals else torch.device("cpu")
+        dtype = torch.float32
+
+        # The published SGG-ToolKit RPCM connects every pair of distinct
+        # objects within each image.  It does not derive the entity graph only
+        # from directed relation chains as the later dual-view fork does.
+        toolkit_entity_map = None
+        if self.relation_graph_mode == "sgg_toolkit":
+            toolkit_entity_map = torch.zeros(
+                (obj_num, obj_num),
+                dtype=dtype,
+                device=device,
+            )
+            offset = 0
+            for proposal in proposals:
+                num_obj_i = len(proposal)
+                if num_obj_i > 0:
+                    block = torch.ones(
+                        (num_obj_i, num_obj_i),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    block.fill_diagonal_(0.0)
+                    toolkit_entity_map[
+                        offset : offset + num_obj_i,
+                        offset : offset + num_obj_i,
+                    ] = block
+                offset += num_obj_i
+
         if obj_num == 0 or not proposal_pairs:
-            device = proposals[0].bbox.device if proposals else torch.device("cpu")
             return (
                 torch.zeros((obj_num, 0), device=device),
                 torch.zeros((obj_num, 0), device=device),
                 torch.zeros((0, 0), device=device),
                 torch.zeros((0, 0), device=device),
-                torch.zeros((obj_num, obj_num), device=device),
+                toolkit_entity_map
+                if toolkit_entity_map is not None
+                else torch.zeros((obj_num, obj_num), device=device),
             )
         rel_inds = []
         offset = 0
@@ -2475,17 +2969,17 @@ class RPCMLegacy(nn.Module):
                 rel_inds.append(pair_idx.to(dtype=torch.long) + offset)
             offset += len(proposal)
         if not rel_inds:
-            device = proposals[0].bbox.device
             return (
                 torch.zeros((obj_num, 0), device=device),
                 torch.zeros((obj_num, 0), device=device),
                 torch.zeros((0, 0), device=device),
                 torch.zeros((0, 0), device=device),
-                torch.zeros((obj_num, obj_num), device=device),
+                toolkit_entity_map
+                if toolkit_entity_map is not None
+                else torch.zeros((obj_num, obj_num), device=device),
             )
         rel_inds = torch.cat(rel_inds, dim=0)
         device = rel_inds.device
-        dtype = torch.float32
         num_rels = rel_inds.size(0)
         subj_pred_map = torch.zeros((obj_num, num_rels), dtype=dtype, device=device)
         obj_pred_map = torch.zeros((obj_num, num_rels), dtype=dtype, device=device)
@@ -2493,14 +2987,27 @@ class RPCMLegacy(nn.Module):
         subj_pred_map[rel_inds[:, 0], arange_rel] = 1.0
         obj_pred_map[rel_inds[:, 1], arange_rel] = 1.0
 
-        pred_pred_subj = (subj_pred_map.t() @ subj_pred_map) > 0
-        pred_pred_obj = (obj_pred_map.t() @ obj_pred_map) > 0
-        pred_pred_subj.fill_diagonal_(False)
-        pred_pred_obj.fill_diagonal_(False)
+        if self.relation_graph_mode in {"sgg_toolkit", "unified"}:
+            # One E x E adjacency is sufficient for the STAR-style graph. The
+            # endpoint incidence product includes subject-subject,
+            # object-object, and both cross-role sharing cases without first
+            # materializing four dense E x E matrices.
+            endpoint_pred_map = (subj_pred_map + obj_pred_map).clamp(max=1.0)
+            pred_pred_subj = (endpoint_pred_map.t() @ endpoint_pred_map) > 0
+            pred_pred_subj.fill_diagonal_(False)
+            pred_pred_obj = pred_pred_subj.new_zeros((0, 0))
+        else:
+            pred_pred_subj = (subj_pred_map.t() @ subj_pred_map) > 0
+            pred_pred_obj = (obj_pred_map.t() @ obj_pred_map) > 0
+            pred_pred_subj.fill_diagonal_(False)
+            pred_pred_obj.fill_diagonal_(False)
 
-        cross = (obj_pred_map @ subj_pred_map.t()) > 0
-        entity_map = cross | cross.t()
-        entity_map.fill_diagonal_(False)
+        if toolkit_entity_map is not None:
+            entity_map = toolkit_entity_map
+        else:
+            cross = (obj_pred_map @ subj_pred_map.t()) > 0
+            entity_map = cross | cross.t()
+            entity_map.fill_diagonal_(False)
         return (
             subj_pred_map,
             obj_pred_map,
@@ -2571,20 +3078,87 @@ class RPCMLegacy(nn.Module):
             [pair_idx.clone() for pair_idx in rel_pair_idxs],
         )
 
+        pred_pred_unified = (
+            pred_pred_subj
+            if self.relation_graph_mode in {"sgg_toolkit", "unified"}
+            else None
+        )
+
         obj_feats = [augment_obj_feat]
         pred_feats = [rel_feats]
-        for t in range(self.feat_update_step):
-            obj_feats.append(self.gcn_ent2ent[t](obj_feats[t], entity_map))
-            if pred_feats[t].numel() == 0:
-                pred_feats.append(pred_feats[t])
-                continue
-            source_sub_rel = self.gcn_ent2rel[t](pred_feats[t], obj_feats[t], subj_pred_map.t(), 0)
-            source_obj_rel = self.gcn_ent2rel[t](pred_feats[t], obj_feats[t], obj_pred_map.t(), 1)
-            source_pred_sub = self.gcn_rel2rel[t](pred_feats[t], pred_pred_subj)
-            source_pred_obj = self.gcn_rel2rel[t](pred_feats[t], pred_pred_obj)
-            pred_feats.append((source_sub_rel + source_obj_rel + source_pred_sub + source_pred_obj) / 4.0)
+        if self.relation_graph_mode == "sgg_toolkit":
+            for _ in range(self.feat_update_step):
+                t = len(obj_feats) - 1
+                source_obj = self.gcn_collect_feat(
+                    obj_feats[t], obj_feats[t], entity_map, 4
+                )
+                source_rel_sub = self.gcn_collect_feat(
+                    obj_feats[t], pred_feats[t], subj_pred_map, 0
+                )
+                source_rel_obj = self.gcn_collect_feat(
+                    obj_feats[t], pred_feats[t], obj_pred_map, 1
+                )
+                source2obj_all = (
+                    source_obj + source_rel_sub + source_rel_obj
+                ) / 3.0
+                obj_feats.append(
+                    self.gcn_update_feat(obj_feats[t], source2obj_all, 0)
+                )
 
-        rel_features = torch.stack(pred_feats, dim=0).mean(dim=0) if pred_feats else rel_feats
+                source_sub_rel = self.gcn_collect_feat(
+                    pred_feats[t], obj_feats[t], subj_pred_map.t(), 2
+                )
+                source_obj_rel = self.gcn_collect_feat(
+                    pred_feats[t], obj_feats[t], obj_pred_map.t(), 3
+                )
+                source_rel_rel = self.gcn_collect_feat(
+                    pred_feats[t], pred_feats[t], pred_pred_unified, 5
+                )
+                source2rel_all = (
+                    source_sub_rel + source_obj_rel + source_rel_rel
+                ) / 3.0
+                pred_feats.append(
+                    self.gcn_update_feat(pred_feats[t], source2rel_all, 1)
+                )
+
+            # SGG-ToolKit consumes the last update, not the mean of all graph
+            # states used by the later RPCM fork.
+            rel_features = pred_feats[-1]
+        else:
+            for t in range(self.feat_update_step):
+                obj_feats.append(self.gcn_ent2ent[t](obj_feats[t], entity_map))
+                if pred_feats[t].numel() == 0:
+                    pred_feats.append(pred_feats[t])
+                    continue
+                source_sub_rel = self.gcn_ent2rel[t](pred_feats[t], obj_feats[t], subj_pred_map.t(), 0)
+                source_obj_rel = self.gcn_ent2rel[t](pred_feats[t], obj_feats[t], obj_pred_map.t(), 1)
+                relation_sources = [source_sub_rel, source_obj_rel]
+                if self.relation_graph_mode == "unified":
+                    relation_sources.append(self.gcn_rel2rel[t](pred_feats[t], pred_pred_unified))
+                else:
+                    if self.rel_subj_view_enabled:
+                        relation_sources.append(self.gcn_rel2rel[t](pred_feats[t], pred_pred_subj))
+                    if self.rel_obj_view_enabled:
+                        relation_sources.append(self.gcn_rel2rel[t](pred_feats[t], pred_pred_obj))
+                # Avoid stacking [num_sources, num_relations, graph_dim]: at
+                # the STAR top-10000 limit that temporary alone can consume
+                # hundreds of MiB.
+                combined_source = relation_sources[0]
+                for source in relation_sources[1:]:
+                    combined_source = combined_source + source
+                pred_feats.append(combined_source / float(len(relation_sources)))
+
+            rel_features = torch.stack(pred_feats, dim=0).mean(dim=0) if pred_feats else rel_feats
+        if self.exact_6850 and self.relation_graph_mode == "dual_view":
+            # The 6850 fork averaged all entity states, just as it averaged all
+            # relation states.  This matters for SGCls/SGDet object refinement;
+            # PredCls still returns GT one-hot object logits.
+            obj_features = obj_feats[0]
+            for obj_state in obj_feats[1:]:
+                obj_features = obj_features + obj_state
+            obj_features = obj_features / float(len(obj_feats))
+        else:
+            obj_features = obj_feats[-1]
         rel_hidden = self.down_samp(rel_features)
         rel_hidden = self.rel_norm(self.rel_residual(rel_hidden) + rel_hidden)
 
@@ -2638,7 +3212,7 @@ class RPCMLegacy(nn.Module):
 
         num_rels = [pair_idx.size(0) for pair_idx in rel_pair_idxs]
         relation_logits = list(relation_logits.split(num_rels, dim=0)) if num_rels else []
-        refine_logits = self._refine_logits(obj_feats[-1], proposals)
+        refine_logits = self._refine_logits(obj_features, proposals)
         return relation_logits, refine_logits, add_losses
 
 
@@ -2652,9 +3226,13 @@ class RPCMOriginalLegacy(RPCMLegacy):
 
     def __init__(self, cfg: dict, in_channels: int):
         super().__init__(cfg, in_channels)
-        self.pairwise_feature_extractor = _OriginalRPCMPairwiseFeatureExtractor(cfg, in_channels)
+        if not isinstance(self.pairwise_feature_extractor, _OriginalRPCMPairwiseFeatureExtractor):
+            raise RuntimeError(
+                "RPCMOriginalLegacy must be constructed with the original PairwiseFeatureExtractor"
+            )
         print(
-            "[RPCM_ORIGINAL_LEGACY] using original PairwiseFeatureExtractor and radian OBB geometry",
+            "[RPCM_ORIGINAL_LEGACY] using original PairwiseFeatureExtractor, "
+            "RPCM GloVe initialization, and radian OBB geometry",
             flush=True,
         )
 
@@ -3103,10 +3681,6 @@ class QueryHierarchyRelationPredictor(nn.Module):
 
 def make_roi_relation_predictor(cfg: dict, in_channels: int):
     predictor_name = str(_cfg_get(cfg, "MODEL", "ROI_RELATION_HEAD", "PREDICTOR", default="Placeholder")).upper()
-    if predictor_name in {"TYPED_HYPER_RPCM", "TYPED_RPCM"}:
-        from sgg.modeling.roi_heads.typed_hyper_rpcm import TypedHyperRPCM
-
-        return TypedHyperRPCM(cfg, in_channels)
     if predictor_name in {"HIER_SUBGRAPH", "QUERY_HIERARCHY", "QHSG"}:
         return QueryHierarchyRelationPredictor(cfg, in_channels)
     if predictor_name in {"RPCM_ORIGINAL_LEGACY", "ORIGINAL_RPCM_LEGACY", "RPCM_NATIVE_LEGACY"}:

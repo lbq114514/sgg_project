@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-pyg}"
+CONDA_ENV="${CONDA_ENV:-sgg}"
 DEVICE="${DEVICE:-cuda}"
 CONFIG="${CONFIG:-configs/star_sgcls_obb_train.py}"
 CHECKPOINT="${CHECKPOINT:-outputs/star_sgcls_obb_train/model_last.pth}"
@@ -56,4 +56,9 @@ echo "Split: ${SPLIT}"
 echo "Device: ${DEVICE}"
 echo "Max images: ${MAX_IMAGES}"
 echo "Filter: ${FILTER_METHOD}"
-"${cmd[@]}"
+env \
+  FILTER_METHOD="${FILTER_METHOD}" \
+  RSGP_MODE="${RSGP_MODE}" \
+  RSGP_TOPK="${RSGP_TOPK}" \
+  RSGP_PPG_PROTECTED_TOPK="${RSGP_PPG_PROTECTED_TOPK}" \
+  "${cmd[@]}"

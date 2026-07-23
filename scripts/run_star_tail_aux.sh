@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Clean detector-only HPRC training launcher.
+#
+# The implementation/config keys retain the historical ``tail_aux`` name for
+# checkpoint compatibility.  A fresh launch initializes only the frozen OBB
+# detector configured by star_predcls_obb_tail_aux_train.py; relation/GNN,
+# prototype and HPRC parameters start from their corrected initializers.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-pyg}"
-DEVICE="${DEVICE:-cuda}"
 CONFIG="${CONFIG:-configs/star_predcls_obb_tail_aux_train.py}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_tail_aux}"
-INIT_RPCM="${INIT_RPCM-/home/ubuntu/research/ssd/RPCM/weights/6850_4135.pth}"
-RESUME="${RESUME:-}"
-START_EPOCH="${START_EPOCH:-}"
-LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/train.log}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/star_predcls_obb_hprc_scratch}"
+DETECTOR_CHECKPOINT="pretrained/OBB_swin_L_OBD.pth"
 
 cd "${ROOT_DIR}"
 
@@ -20,58 +21,26 @@ if [[ ! -f "${CONFIG}" ]]; then
   echo "Config not found: ${CONFIG}" >&2
   exit 1
 fi
-if [[ -n "${RESUME}" && ! -f "${RESUME}" ]]; then
-  echo "Resume checkpoint not found: ${RESUME}" >&2
-  exit 1
-fi
-if [[ -z "${RESUME}" && -n "${INIT_RPCM}" && ! -f "${INIT_RPCM}" ]]; then
-  echo "RPCM initialization checkpoint not found: ${INIT_RPCM}" >&2
-  echo "Set INIT_RPCM='' to train from random relation-head initialization." >&2
+if [[ ! -f "${DETECTOR_CHECKPOINT}" ]]; then
+  echo "Detector checkpoint not found: ${DETECTOR_CHECKPOINT}" >&2
   exit 1
 fi
 
-mkdir -p "${OUTPUT_DIR}"
-STATUS_FILE="${OUTPUT_DIR}/exit_code.txt"
-PID_FILE="${OUTPUT_DIR}/train.pid"
-rm -f "${STATUS_FILE}"
-
-source "${CONDA_SH}"
-conda activate "${CONDA_ENV}"
-
-cmd=(python train.py --config "${CONFIG}" --device "${DEVICE}")
-if [[ -n "${RESUME}" ]]; then
-  cmd+=(--resume "${RESUME}")
-elif [[ -n "${INIT_RPCM}" ]]; then
-  cmd+=(--init-rpcm "${INIT_RPCM}")
-fi
-if [[ -n "${START_EPOCH}" ]]; then
-  cmd+=(--start-epoch "${START_EPOCH}")
-fi
-
-if [[ -n "${RESUME}" ]]; then
-  nohup bash -lc '
-    "$@"
-    status=$?
-    printf "%s\n" "${status}" > "'"${STATUS_FILE}"'"
-    exit "${status}"
-  ' _ "${cmd[@]}" >> "${LOG_FILE}" 2>&1 &
-else
-  nohup bash -lc '
-    "$@"
-    status=$?
-    printf "%s\n" "${status}" > "'"${STATUS_FILE}"'"
-    exit "${status}"
-  ' _ "${cmd[@]}" > "${LOG_FILE}" 2>&1 &
-fi
-
-pid="$!"
-printf "%s\n" "${pid}" > "${PID_FILE}"
-
-echo "Started STAR tail-aux experiment"
-echo "PID: ${pid}"
+echo "Launching clean STAR PredCls HPRC training"
 echo "Config: ${CONFIG}"
-echo "Init RPCM: ${INIT_RPCM:-<none>}"
-echo "Resume: ${RESUME:-<none>}"
+echo "Initialization: detector-only (${DETECTOR_CHECKPOINT})"
+echo "Relation initialization: corrected RPCM/HPRC initializers (no RPCM checkpoint)"
 echo "Output: ${OUTPUT_DIR}"
-echo "Log: ${LOG_FILE}"
-echo "Status: ${STATUS_FILE}"
+
+# Force INIT_RPCM empty even if it exists in the caller's environment.  Resume
+# remains available through RESUME=... and is handled by the common launcher.
+CONFIG="${CONFIG}" \
+OUTPUT_DIR="${OUTPUT_DIR}" \
+INIT_RPCM="" \
+BASE_LR="${HPRC_BASE_LR:-0.016}" \
+MAX_EPOCHS="${HPRC_MAX_EPOCHS:-300}" \
+STEPS="${HPRC_STEPS:-10000,14000,16000}" \
+VAL_START_PERIOD="${HPRC_VAL_START_PERIOD:-120}" \
+VAL_PERIOD="${HPRC_VAL_PERIOD:-2}" \
+CHECKPOINT_PERIOD="${HPRC_CHECKPOINT_PERIOD:-4}" \
+bash "${SCRIPT_DIR}/run_star_experiment.sh"

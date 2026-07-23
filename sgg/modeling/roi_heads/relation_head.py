@@ -8,7 +8,6 @@ from torch import nn
 
 from sgg.modeling.roi_heads.ppg import PairProposalGenerator
 from sgg.modeling.roi_heads.pair_proposal_network import PairProposalNetworkFilter
-from sgg.modeling.roi_heads.pair_graph_builder import PairGraphBuilder
 from sgg.modeling.roi_heads.rsgp import RemoteSensingGraphProposalFilter
 from sgg.modeling.roi_heads.relation_inference import make_roi_relation_post_processor
 from sgg.modeling.roi_heads.relation_loss import make_roi_relation_loss_evaluator
@@ -97,13 +96,6 @@ class ROIRelationHead(nn.Module):
         self.use_gt_object_label = bool(rel_cfg.get("USE_GT_OBJECT_LABEL", False))
         self.predictor_name = str(rel_cfg.get("PREDICTOR", ""))
         self.legacy_filter_flow = bool(rel_cfg.get("RPCM_LEGACY_FILTER_FLOW", False))
-        self.use_typed_pair_graph = self.predictor_name.upper() in {
-            "TYPED_HYPER_RPCM", "TYPED_RPCM"
-        }
-        self.pair_graph_builder = (
-            PairGraphBuilder(cfg, self.ppg, self.sema_filter)
-            if self.use_typed_pair_graph else None
-        )
         self.num_obj_classes = int(cfg["MODEL"]["ROI_BOX_HEAD"]["NUM_CLASSES"])
 
     def _feature_device(self, features) -> torch.device:
@@ -205,42 +197,22 @@ class ROIRelationHead(nn.Module):
         del s_f, kwargs
         if self.training:
             with torch.no_grad():
-                if self.use_typed_pair_graph:
-                    rel_pair_idxs, rel_labels, _ = self.pair_graph_builder.build(
-                        proposals, targets=targets, training=True
-                    )
-                    if targets is not None:
-                        for proposal, target in zip(proposals, targets):
-                            for field_name in ("all_relation_triplets", "relation_triplets"):
-                                if target.has_field(field_name) and not proposal.has_field(field_name):
-                                    proposal.add_field(field_name, target.get_field(field_name).to(proposal.bbox.device))
-                    rel_binarys = None
-                elif self.use_gt_box:
+                if self.use_gt_box:
                     proposals, rel_labels, rel_pair_idxs, rel_binarys = self.samp_processor.gtbox_relsample(proposals, targets)
                 else:
                     proposals, rel_labels, rel_pair_idxs, rel_binarys = self.samp_processor.detect_relsample(proposals, targets)
         else:
             rel_labels, rel_binarys = None, None
-            if self.use_typed_pair_graph:
-                rel_pair_idxs, _, _ = self.pair_graph_builder.build(
-                    proposals, targets=None, training=False
-                )
-                for proposal, pair_idx in zip(proposals, rel_pair_idxs):
-                    proposal.add_field("base_rel_pair_idxs", pair_idx)
-                    proposal.add_field("sema_rel_pair_idxs", pair_idx)
-                    proposal.add_field("final_rel_pair_idxs", pair_idx)
-                    proposal.add_field("pruned_rel_pair_idxs", pair_idx)
-            else:
-                rel_pair_idxs = self.samp_processor.prepare_test_pairs(self._feature_device(features), proposals)
-                for proposal, pair_idx in zip(proposals, rel_pair_idxs):
-                    proposal.add_field("base_rel_pair_idxs", pair_idx)
-                rel_pair_idxs = [
-                    self._filter_test_pairs_for_proposal(proposal, pair_idx)
-                    for proposal, pair_idx in zip(proposals, rel_pair_idxs)
-                ]
+            rel_pair_idxs = self.samp_processor.prepare_test_pairs(self._feature_device(features), proposals)
+            for proposal, pair_idx in zip(proposals, rel_pair_idxs):
+                proposal.add_field("base_rel_pair_idxs", pair_idx)
+            rel_pair_idxs = [
+                self._filter_test_pairs_for_proposal(proposal, pair_idx)
+                for proposal, pair_idx in zip(proposals, rel_pair_idxs)
+            ]
 
         if self.use_gt_box and self.use_gt_object_label and (
-            self.predictor_name in {"RPCM", "RPCM_LEGACY", "LEGACY_RPCM"} or self.use_typed_pair_graph
+            self.predictor_name in {"RPCM", "RPCM_LEGACY", "LEGACY_RPCM"}
         ):
             for proposal in proposals:
                 labels = proposal.get_field("labels").long().clamp(min=0, max=self.num_obj_classes - 1)

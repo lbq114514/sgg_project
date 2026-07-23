@@ -1,0 +1,7 @@
+-r requirements.clean.txt
+
+# Optional plotting and development tools. They are not needed by train.py or
+# the task-specific evaluation entry points.
+matplotlib==3.10.3
+pytest==9.1.1
+
